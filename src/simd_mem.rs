@@ -72,12 +72,11 @@ pub(crate) fn store_at<V: Pod, T: Pod>(dst: &mut [T], at: usize, v: V) {
 /// Whether `n` rows of `size` bytes, `stride` apart from `at`, lie within `len` bytes.
 #[inline(always)]
 fn rows_fit(len: usize, at: usize, stride: usize, n: usize, size: usize) -> bool {
-    n > 0
-        && stride
-            .checked_mul(n - 1)
-            .and_then(|s| s.checked_add(at))
-            .and_then(|s| s.checked_add(size))
-            .is_some_and(|end| end <= len)
+    // A slice spans at most `isize::MAX` bytes, so with `at <= len` and these bounds the end
+    // does not wrap: three comparisons for constant `n` and `size`.
+    const HALF: usize = isize::MAX as usize / 2;
+    let end = at.wrapping_add(stride.wrapping_mul(n.wrapping_sub(1))).wrapping_add(size);
+    (n > 0) & (size <= HALF) & (stride <= HALF / n.max(1)) & (at <= len) & (end <= len)
 }
 
 /// `N` values of `V` from `src`, at `at`, `at + stride`, ..., checked once.
@@ -166,5 +165,45 @@ pub(crate) mod avx2 {
         let idx = _mm_and_si128(idx, _mm_set1_epi32(255));
         // SAFETY: every index is below 256.
         unsafe { _mm256_i32gather_epi64::<8>(table.as_ptr().cast(), idx) }
+    }
+}
+
+/// `N` rows of `W` bytes, `stride` apart from `at` in a byte slice, checked once when made.
+/// Its loads and stores check their row and column against `N` and `W` only, which folds
+/// away for constant ones.
+pub(crate) struct Rows<'a, const N: usize, const W: usize> {
+    ptr: *mut u8,
+    stride: usize,
+    _buf: core::marker::PhantomData<&'a mut [u8]>,
+}
+
+impl<'a, const N: usize, const W: usize> Rows<'a, N, W> {
+    #[inline(always)]
+    pub(crate) fn new(buf: &'a mut [u8], at: usize, stride: usize) -> Self {
+        assert!(rows_fit(buf.len(), at, stride, N, W));
+        let ptr = buf.as_mut_ptr().wrapping_add(at);
+        Self { ptr, stride, _buf: core::marker::PhantomData }
+    }
+
+    #[inline(always)]
+    fn offset<V>(&self, row: usize, col: usize) -> usize {
+        assert!(row < N && col <= W && size_of::<V>() <= W - col);
+        row * self.stride + col
+    }
+
+    /// A `V` from row `row`, column `col`.
+    #[inline(always)]
+    pub(crate) fn load<V: Pod>(&self, row: usize, col: usize) -> V {
+        let at = self.offset::<V>(row, col);
+        // SAFETY: the bytes lie in row `row` by `offset`, within the slice by `new`.
+        unsafe { self.ptr.add(at).cast::<V>().read_unaligned() }
+    }
+
+    /// Writes `v` to row `row`, column `col`.
+    #[inline(always)]
+    pub(crate) fn store<V: Pod>(&mut self, row: usize, col: usize, v: V) {
+        let at = self.offset::<V>(row, col);
+        // SAFETY: as in `load`; any bytes make valid `u8`s.
+        unsafe { self.ptr.add(at).cast::<V>().write_unaligned(v) }
     }
 }

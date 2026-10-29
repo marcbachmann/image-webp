@@ -1,30 +1,29 @@
 //! NEON decoder kernels with the API of `sse2.rs`, ported from libwebp's `dsp/dec_neon.c`,
 //! `dsp/upsampling_neon.c` and the SSE2 kernels, bit-exact with the portable ones. NEON is
-//! part of aarch64, so no runtime detection is needed. Each wrapper checks the bounds its
-//! loads and stores rely on; `p` is the offset of the first pixel past the edge.
+//! part of aarch64, so no runtime detection is needed. Their loads and stores go through
+//! `simd_mem`, which checks their bounds; `p` is the offset of the first pixel past the edge.
 //!
 //! libwebp: Copyright Google Inc., BSD 3-Clause, see LICENSE-LIBWEBP.
-#![allow(unsafe_code)]
 
 use core::arch::aarch64::*;
 
-#[inline(always)]
-fn check(len: usize, p: usize, back: usize, fwd: usize) {
-    assert!(p >= back && p.checked_add(fwd).is_some_and(|end| end <= len));
-}
+use crate::simd_mem::{load, load_at, load_rows, neon, store, store_rows, Rows};
 
-#[inline(always)]
-unsafe fn flip(x: uint8x16_t) -> int8x16_t {
+#[target_feature(enable = "neon")]
+#[inline]
+fn flip(x: uint8x16_t) -> int8x16_t {
     vreinterpretq_s8_u8(veorq_u8(x, vdupq_n_u8(0x80)))
 }
 
-#[inline(always)]
-unsafe fn flip_back(x: int8x16_t) -> uint8x16_t {
+#[target_feature(enable = "neon")]
+#[inline]
+fn flip_back(x: int8x16_t) -> uint8x16_t {
     veorq_u8(vreinterpretq_u8_s8(x), vdupq_n_u8(0x80))
 }
 
-#[inline(always)]
-unsafe fn needs_filter(
+#[target_feature(enable = "neon")]
+#[inline]
+fn needs_filter(
     p1: uint8x16_t,
     p0: uint8x16_t,
     q0: uint8x16_t,
@@ -39,9 +38,10 @@ unsafe fn needs_filter(
     vcgeq_u8(vdupq_n_u8(thresh), sum)
 }
 
-#[inline(always)]
+#[target_feature(enable = "neon")]
+#[inline]
 #[allow(clippy::too_many_arguments)]
-unsafe fn needs_filter2(
+fn needs_filter2(
     p3: uint8x16_t,
     p2: uint8x16_t,
     p1: uint8x16_t,
@@ -60,8 +60,9 @@ unsafe fn needs_filter2(
     vandq_u8(interior, needs_filter(p1, p0, q0, q1, thresh))
 }
 
-#[inline(always)]
-unsafe fn needs_hev(
+#[target_feature(enable = "neon")]
+#[inline]
+fn needs_hev(
     p1: uint8x16_t,
     p0: uint8x16_t,
     q0: uint8x16_t,
@@ -72,30 +73,34 @@ unsafe fn needs_hev(
     vcgtq_u8(m, vdupq_n_u8(hev))
 }
 
-#[inline(always)]
-unsafe fn base_delta(p1: int8x16_t, p0: int8x16_t, q0: int8x16_t, q1: int8x16_t) -> int8x16_t {
+#[target_feature(enable = "neon")]
+#[inline]
+fn base_delta(p1: int8x16_t, p0: int8x16_t, q0: int8x16_t, q1: int8x16_t) -> int8x16_t {
     let q0_p0 = vqsubq_s8(q0, p0);
     let s1 = vqaddq_s8(vqsubq_s8(p1, q1), q0_p0);
     let s2 = vqaddq_s8(q0_p0, s1);
     vqaddq_s8(q0_p0, s2)
 }
 
-#[inline(always)]
-unsafe fn base_delta0(p0: int8x16_t, q0: int8x16_t) -> int8x16_t {
+#[target_feature(enable = "neon")]
+#[inline]
+fn base_delta0(p0: int8x16_t, q0: int8x16_t) -> int8x16_t {
     let q0_p0 = vqsubq_s8(q0, p0);
     vqaddq_s8(q0_p0, vqaddq_s8(q0_p0, q0_p0))
 }
 
 /// libwebp's `ApplyFilter2NoFlip`: `p0 + (delta + 3) >> 3` and `q0 - (delta + 4) >> 3`.
-#[inline(always)]
-unsafe fn apply_filter2(p0: int8x16_t, q0: int8x16_t, delta: int8x16_t) -> (int8x16_t, int8x16_t) {
+#[target_feature(enable = "neon")]
+#[inline]
+fn apply_filter2(p0: int8x16_t, q0: int8x16_t, delta: int8x16_t) -> (int8x16_t, int8x16_t) {
     let d3 = vshrq_n_s8::<3>(vqaddq_s8(delta, vdupq_n_s8(3)));
     let d4 = vshrq_n_s8::<3>(vqaddq_s8(delta, vdupq_n_s8(4)));
     (vqaddq_s8(p0, d3), vqsubq_s8(q0, d4))
 }
 
-#[inline(always)]
-unsafe fn do_filter2(
+#[target_feature(enable = "neon")]
+#[inline]
+fn do_filter2(
     p1: uint8x16_t,
     p0: &mut uint8x16_t,
     q0: &mut uint8x16_t,
@@ -113,8 +118,9 @@ unsafe fn do_filter2(
     *q0 = flip_back(q0s);
 }
 
-#[inline(always)]
-unsafe fn do_filter4(
+#[target_feature(enable = "neon")]
+#[inline]
+fn do_filter4(
     p1: &mut uint8x16_t,
     p0: &mut uint8x16_t,
     q0: &mut uint8x16_t,
@@ -141,9 +147,10 @@ unsafe fn do_filter4(
     *q1 = flip_back(vqsubq_s8(q1s, a3));
 }
 
-#[inline(always)]
+#[target_feature(enable = "neon")]
+#[inline]
 #[allow(clippy::too_many_arguments)]
-unsafe fn do_filter6(
+fn do_filter6(
     p2: &mut uint8x16_t,
     p1: &mut uint8x16_t,
     p0: &mut uint8x16_t,
@@ -182,8 +189,9 @@ unsafe fn do_filter6(
 }
 
 /// Two side-by-side 8x8 byte transposes, one in each half of the registers.
-#[inline(always)]
-unsafe fn transpose8x8x2(r: [uint8x16_t; 8]) -> [uint8x16_t; 8] {
+#[target_feature(enable = "neon")]
+#[inline]
+fn transpose8x8x2(r: [uint8x16_t; 8]) -> [uint8x16_t; 8] {
     let r01 = vtrnq_u8(r[0], r[1]);
     let r23 = vtrnq_u8(r[2], r[3]);
     let r45 = vtrnq_u8(r[4], r[5]);
@@ -211,76 +219,73 @@ unsafe fn transpose8x8x2(r: [uint8x16_t; 8]) -> [uint8x16_t; 8] {
     ]
 }
 
-/// 8 columns of 8 rows from `a` (low halves) and 8 rows from `b` (high halves), one
-/// register per column.
-#[inline(always)]
-unsafe fn load8x16t(a: *const u8, b: *const u8, stride: usize) -> [uint8x16_t; 8] {
-    let row = |k: usize| vcombine_u8(vld1_u8(a.add(k * stride)), vld1_u8(b.add(k * stride)));
-    transpose8x8x2([
-        row(0),
-        row(1),
-        row(2),
-        row(3),
-        row(4),
-        row(5),
-        row(6),
-        row(7),
-    ])
+/// The 8 columns of 8 rows `a` (low halves) and 8 rows `b` (high halves), one register per
+/// column.
+#[target_feature(enable = "neon")]
+#[inline]
+fn columns(a: [uint8x8_t; 8], b: [uint8x8_t; 8]) -> [uint8x16_t; 8] {
+    transpose8x8x2(core::array::from_fn(|k| vcombine_u8(a[k], b[k])))
 }
 
-#[inline(always)]
-unsafe fn store8x16t(c: [uint8x16_t; 8], a: *mut u8, b: *mut u8, stride: usize) {
-    for (k, r) in transpose8x8x2(c).into_iter().enumerate() {
-        vst1_u8(a.add(k * stride), vget_low_u8(r));
-        vst1_u8(b.add(k * stride), vget_high_u8(r));
-    }
+/// The inverse of `columns`.
+#[target_feature(enable = "neon")]
+#[inline]
+fn rows(c: [uint8x16_t; 8]) -> ([uint8x8_t; 8], [uint8x8_t; 8]) {
+    let t = transpose8x8x2(c);
+    (
+        core::array::from_fn(|k| vget_low_u8(t[k])),
+        core::array::from_fn(|k| vget_high_u8(t[k])),
+    )
 }
 
-#[inline(always)]
-unsafe fn load16(b: *const u8) -> uint8x16_t {
-    vld1q_u8(b)
+/// The 8 columns of the 16 rows of 8 bytes from `at`, the first 8 rows in the low halves.
+#[target_feature(enable = "neon")]
+#[inline]
+fn load8x16t(buf: &[u8], at: usize, stride: usize) -> [uint8x16_t; 8] {
+    columns(load_rows(buf, at, stride), load_rows(buf, at + 8 * stride, stride))
 }
 
-#[inline(always)]
-unsafe fn store16(b: *mut u8, x: uint8x16_t) {
-    vst1q_u8(b, x)
+#[target_feature(enable = "neon")]
+#[inline]
+fn store8x16t(buf: &mut [u8], at: usize, stride: usize, c: [uint8x16_t; 8]) {
+    let (a, b) = rows(c);
+    store_rows(buf, at, stride, a);
+    store_rows(buf, at + 8 * stride, stride, b);
 }
 
+#[allow(unsafe_code)]
 #[inline(always)]
-unsafe fn load_uv(u: *const u8, v: *const u8) -> uint8x16_t {
-    vcombine_u8(vld1_u8(u), vld1_u8(v))
-}
-
-#[inline(always)]
-unsafe fn store_uv(x: uint8x16_t, u: *mut u8, v: *mut u8) {
-    vst1_u8(u, vget_low_u8(x));
-    vst1_u8(v, vget_high_u8(x));
-}
-
 pub(crate) fn simple_v16(buf: &mut [u8], p: usize, stride: usize, thresh: u8) {
-    check(buf.len(), p, 2 * stride, stride + 16);
-    unsafe {
-        let b = buf.as_mut_ptr().add(p);
-        let p1 = load16(b.sub(2 * stride));
-        let mut p0 = load16(b.sub(stride));
-        let mut q0 = load16(b);
-        let q1 = load16(b.add(stride));
-        do_filter2(p1, &mut p0, &mut q0, q1, thresh);
-        store16(b.sub(stride), p0);
-        store16(b, q0);
-    }
+    // SAFETY: NEON is part of aarch64.
+    unsafe { simple_v16_neon(buf, p, stride, thresh) }
 }
 
+#[target_feature(enable = "neon")]
+#[inline]
+fn simple_v16_neon(buf: &mut [u8], p: usize, stride: usize, thresh: u8) {
+    let mut b = Rows::<4, 16>::new(buf, p - 2 * stride, stride);
+    let [p1, mut p0, mut q0, q1] = core::array::from_fn(|k| b.load(k, 0));
+    do_filter2(p1, &mut p0, &mut q0, q1, thresh);
+    b.store(1, 0, p0);
+    b.store(2, 0, q0);
+}
+
+#[allow(unsafe_code)]
+#[inline(always)]
 pub(crate) fn simple_h16(buf: &mut [u8], p: usize, stride: usize, thresh: u8) {
-    check(buf.len(), p, 4, 15 * stride + 4);
-    unsafe {
-        let b = buf.as_mut_ptr().add(p - 4);
-        let mut c = load8x16t(b, b.add(8 * stride), stride);
-        let [_, _, p1, mut p0, mut q0, q1, _, _] = c;
-        do_filter2(p1, &mut p0, &mut q0, q1, thresh);
-        (c[3], c[4]) = (p0, q0);
-        store8x16t(c, b, b.add(8 * stride), stride);
-    }
+    // SAFETY: NEON is part of aarch64.
+    unsafe { simple_h16_neon(buf, p, stride, thresh) }
+}
+
+#[target_feature(enable = "neon")]
+#[inline]
+fn simple_h16_neon(buf: &mut [u8], p: usize, stride: usize, thresh: u8) {
+    let at = p - 4;
+    let mut c = load8x16t(buf, at, stride);
+    let [_, _, p1, mut p0, mut q0, q1, _, _] = c;
+    do_filter2(p1, &mut p0, &mut q0, q1, thresh);
+    (c[3], c[4]) = (p0, q0);
+    store8x16t(buf, at, stride, c);
 }
 
 pub(crate) fn simple_v16i(buf: &mut [u8], p: usize, stride: usize, thresh: u8) {
@@ -295,120 +300,139 @@ pub(crate) fn simple_h16i(buf: &mut [u8], p: usize, stride: usize, thresh: u8) {
     }
 }
 
+#[allow(unsafe_code)]
+#[inline(always)]
 pub(crate) fn v16(buf: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
-    check(buf.len(), p, 4 * stride, 3 * stride + 16);
-    unsafe {
-        let b = buf.as_mut_ptr().add(p);
-        let row = |k: isize| load16(b.offset(k * stride as isize));
-        let (p3, mut p2, mut p1, mut p0) = (row(-4), row(-3), row(-2), row(-1));
-        let (mut q0, mut q1, mut q2, q3) = (row(0), row(1), row(2), row(3));
-        let mask = needs_filter2(p3, p2, p1, p0, q0, q1, q2, q3, thresh, ithresh);
-        let hev_mask = needs_hev(p1, p0, q0, q1, hev);
-        do_filter6(
-            &mut p2, &mut p1, &mut p0, &mut q0, &mut q1, &mut q2, mask, hev_mask,
-        );
-        for (k, x) in [(-3isize, p2), (-2, p1), (-1, p0), (0, q0), (1, q1), (2, q2)] {
-            store16(b.offset(k * stride as isize), x);
-        }
+    // SAFETY: NEON is part of aarch64.
+    unsafe { v16_neon(buf, p, stride, thresh, ithresh, hev) }
+}
+
+#[target_feature(enable = "neon")]
+#[inline]
+fn v16_neon(buf: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
+    let mut b = Rows::<8, 16>::new(buf, p - 4 * stride, stride);
+    let [p3, mut p2, mut p1, mut p0, mut q0, mut q1, mut q2, q3] =
+        core::array::from_fn(|k| b.load(k, 0));
+    let mask = needs_filter2(p3, p2, p1, p0, q0, q1, q2, q3, thresh, ithresh);
+    let hev_mask = needs_hev(p1, p0, q0, q1, hev);
+    do_filter6(
+        &mut p2, &mut p1, &mut p0, &mut q0, &mut q1, &mut q2, mask, hev_mask,
+    );
+    for (k, x) in [p2, p1, p0, q0, q1, q2].into_iter().enumerate() {
+        b.store(1 + k, 0, x);
     }
 }
 
+#[allow(unsafe_code)]
+#[inline(always)]
 pub(crate) fn h16(buf: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
-    check(buf.len(), p, 4, 15 * stride + 4);
-    unsafe {
-        let b = buf.as_mut_ptr().add(p - 4);
-        let [p3, mut p2, mut p1, mut p0, mut q0, mut q1, mut q2, q3] =
-            load8x16t(b, b.add(8 * stride), stride);
+    // SAFETY: NEON is part of aarch64.
+    unsafe { h16_neon(buf, p, stride, thresh, ithresh, hev) }
+}
+
+#[target_feature(enable = "neon")]
+#[inline]
+fn h16_neon(buf: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
+    let at = p - 4;
+    let [p3, mut p2, mut p1, mut p0, mut q0, mut q1, mut q2, q3] =
+        load8x16t(buf, at, stride);
+    let mask = needs_filter2(p3, p2, p1, p0, q0, q1, q2, q3, thresh, ithresh);
+    let hev_mask = needs_hev(p1, p0, q0, q1, hev);
+    do_filter6(
+        &mut p2, &mut p1, &mut p0, &mut q0, &mut q1, &mut q2, mask, hev_mask,
+    );
+    store8x16t(buf, at, stride, [p3, p2, p1, p0, q0, q1, q2, q3]);
+}
+
+#[allow(unsafe_code)]
+#[inline(always)]
+pub(crate) fn v16i(buf: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
+    // SAFETY: NEON is part of aarch64.
+    unsafe { v16i_neon(buf, p, stride, thresh, ithresh, hev) }
+}
+
+#[target_feature(enable = "neon")]
+#[inline]
+fn v16i_neon(buf: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
+    let mut b = Rows::<16, 16>::new(buf, p, stride);
+    let row = |b: &Rows<16, 16>, k: usize| b.load::<uint8x16_t>(k, 0);
+    let (mut p3, mut p2, mut p1, mut p0) = (row(&b, 0), row(&b, 1), row(&b, 2), row(&b, 3));
+    for k in 0..3 {
+        let e = 4 * k + 4;
+        let (mut q0, mut q1, q2, q3) = (row(&b, e), row(&b, e + 1), row(&b, e + 2), row(&b, e + 3));
         let mask = needs_filter2(p3, p2, p1, p0, q0, q1, q2, q3, thresh, ithresh);
         let hev_mask = needs_hev(p1, p0, q0, q1, hev);
-        do_filter6(
-            &mut p2, &mut p1, &mut p0, &mut q0, &mut q1, &mut q2, mask, hev_mask,
-        );
-        store8x16t(
-            [p3, p2, p1, p0, q0, q1, q2, q3],
-            b,
-            b.add(8 * stride),
-            stride,
-        );
-    }
-}
-
-pub(crate) fn v16i(buf: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
-    check(buf.len(), p, 0, 15 * stride + 16);
-    unsafe {
-        let mut b = buf.as_mut_ptr().add(p);
-        let (mut p3, mut p2, mut p1, mut p0) = (
-            load16(b),
-            load16(b.add(stride)),
-            load16(b.add(2 * stride)),
-            load16(b.add(3 * stride)),
-        );
-        for _ in 0..3 {
-            let d = b.add(2 * stride);
-            b = b.add(4 * stride);
-            let (mut q0, mut q1, q2, q3) = (
-                load16(b),
-                load16(b.add(stride)),
-                load16(b.add(2 * stride)),
-                load16(b.add(3 * stride)),
-            );
-            let mask = needs_filter2(p3, p2, p1, p0, q0, q1, q2, q3, thresh, ithresh);
-            let hev_mask = needs_hev(p1, p0, q0, q1, hev);
-            do_filter4(&mut p1, &mut p0, &mut q0, &mut q1, mask, hev_mask);
-            store16(d, p1);
-            store16(d.add(stride), p0);
-            store16(d.add(2 * stride), q0);
-            store16(d.add(3 * stride), q1);
-            (p3, p2, p1, p0) = (q0, q1, q2, q3);
+        do_filter4(&mut p1, &mut p0, &mut q0, &mut q1, mask, hev_mask);
+        for (k, x) in [p1, p0, q0, q1].into_iter().enumerate() {
+            b.store(e - 2 + k, 0, x);
         }
+        (p3, p2, p1, p0) = (q0, q1, q2, q3);
     }
 }
 
+#[allow(unsafe_code)]
+#[inline(always)]
 pub(crate) fn h16i(buf: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
-    check(buf.len(), p, 0, 15 * stride + 16);
-    unsafe {
-        let b = buf.as_mut_ptr().add(p);
-        let (b0, b8) = (b, b.add(8 * stride));
-        // All 16 columns: the left 8 and the right 8, each filtered edge in registers.
-        let [l0, l1, l2, l3, l4, l5, l6, l7] = load8x16t(b0, b8, stride);
-        let [r0, r1, r2, r3, r4, r5, r6, r7] = load8x16t(b0.add(8), b8.add(8), stride);
-        let mut c = [
-            l0, l1, l2, l3, l4, l5, l6, l7, r0, r1, r2, r3, r4, r5, r6, r7,
-        ];
-        for e in [4, 8, 12] {
-            let mask = needs_filter2(
-                c[e - 4],
-                c[e - 3],
-                c[e - 2],
-                c[e - 1],
-                c[e],
-                c[e + 1],
-                c[e + 2],
-                c[e + 3],
-                thresh,
-                ithresh,
-            );
-            let hev_mask = needs_hev(c[e - 2], c[e - 1], c[e], c[e + 1], hev);
-            let [mut p1, mut p0, mut q0, mut q1] = [c[e - 2], c[e - 1], c[e], c[e + 1]];
-            do_filter4(&mut p1, &mut p0, &mut q0, &mut q1, mask, hev_mask);
-            (c[e - 2], c[e - 1], c[e], c[e + 1]) = (p1, p0, q0, q1);
-        }
-        store8x16t(
-            [c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]],
-            b0,
-            b8,
-            stride,
+    // SAFETY: NEON is part of aarch64.
+    unsafe { h16i_neon(buf, p, stride, thresh, ithresh, hev) }
+}
+
+#[target_feature(enable = "neon")]
+#[inline]
+fn h16i_neon(buf: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
+    // All 16 columns: the left 8 and the right 8, each filtered edge in registers.
+    let (top, bottom) = (p, p + 8 * stride);
+    let t = load_rows::<uint8x16_t, 8>(buf, top, stride);
+    let b = load_rows::<uint8x16_t, 8>(buf, bottom, stride);
+    let [l0, l1, l2, l3, l4, l5, l6, l7] = columns(t.map(|x| vget_low_u8(x)), b.map(|x| vget_low_u8(x)));
+    let [r0, r1, r2, r3, r4, r5, r6, r7] = columns(t.map(|x| vget_high_u8(x)), b.map(|x| vget_high_u8(x)));
+    let mut c = [
+        l0, l1, l2, l3, l4, l5, l6, l7, r0, r1, r2, r3, r4, r5, r6, r7,
+    ];
+    for e in [4, 8, 12] {
+        let mask = needs_filter2(
+            c[e - 4],
+            c[e - 3],
+            c[e - 2],
+            c[e - 1],
+            c[e],
+            c[e + 1],
+            c[e + 2],
+            c[e + 3],
+            thresh,
+            ithresh,
         );
-        store8x16t(
-            [c[8], c[9], c[10], c[11], c[12], c[13], c[14], c[15]],
-            b0.add(8),
-            b8.add(8),
-            stride,
-        );
+        let hev_mask = needs_hev(c[e - 2], c[e - 1], c[e], c[e + 1], hev);
+        let [mut p1, mut p0, mut q0, mut q1] = [c[e - 2], c[e - 1], c[e], c[e + 1]];
+        do_filter4(&mut p1, &mut p0, &mut q0, &mut q1, mask, hev_mask);
+        (c[e - 2], c[e - 1], c[e], c[e + 1]) = (p1, p0, q0, q1);
+    }
+    let (lt, lb) = rows(core::array::from_fn(|k| c[k]));
+    let (rt, rb) = rows(core::array::from_fn(|k| c[k + 8]));
+    store_rows::<_, 8>(buf, top, stride, core::array::from_fn(|k| vcombine_u8(lt[k], rt[k])));
+    store_rows::<_, 8>(buf, bottom, stride, core::array::from_fn(|k| vcombine_u8(lb[k], rb[k])));
+}
+
+/// The 8 rows of `u` (low halves) and `v` (high halves).
+#[target_feature(enable = "neon")]
+#[inline]
+fn load_uv(u: &Rows<8, 8>, v: &Rows<8, 8>) -> [uint8x16_t; 8] {
+    core::array::from_fn(|k| vcombine_u8(u.load(k, 0), v.load(k, 0)))
+}
+
+/// `r` to the rows of `u` (low halves) and `v` (high halves) from `from` on.
+#[target_feature(enable = "neon")]
+#[inline]
+fn store_uv<const N: usize>(u: &mut Rows<8, 8>, v: &mut Rows<8, 8>, from: usize, r: [uint8x16_t; N]) {
+    for (k, x) in r.into_iter().enumerate() {
+        u.store(from + k, 0, vget_low_u8(x));
+        v.store(from + k, 0, vget_high_u8(x));
     }
 }
 
+#[allow(unsafe_code)]
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 pub(crate) fn v8(
     u: &mut [u8],
     v: &mut [u8],
@@ -418,29 +442,36 @@ pub(crate) fn v8(
     ithresh: u8,
     hev: u8,
 ) {
-    check(u.len(), p, 4 * stride, 3 * stride + 8);
-    check(v.len(), p, 4 * stride, 3 * stride + 8);
-    unsafe {
-        let (u, v) = (u.as_mut_ptr().add(p), v.as_mut_ptr().add(p));
-        let row = |k: isize| load_uv(u.offset(k * stride as isize), v.offset(k * stride as isize));
-        let (p3, mut p2, mut p1, mut p0) = (row(-4), row(-3), row(-2), row(-1));
-        let (mut q0, mut q1, mut q2, q3) = (row(0), row(1), row(2), row(3));
-        let mask = needs_filter2(p3, p2, p1, p0, q0, q1, q2, q3, thresh, ithresh);
-        let hev_mask = needs_hev(p1, p0, q0, q1, hev);
-        do_filter6(
-            &mut p2, &mut p1, &mut p0, &mut q0, &mut q1, &mut q2, mask, hev_mask,
-        );
-        for (k, x) in [(-3isize, p2), (-2, p1), (-1, p0), (0, q0), (1, q1), (2, q2)] {
-            store_uv(
-                x,
-                u.offset(k * stride as isize),
-                v.offset(k * stride as isize),
-            );
-        }
-    }
+    // SAFETY: NEON is part of aarch64.
+    unsafe { v8_neon(u, v, p, stride, thresh, ithresh, hev) }
 }
 
+#[target_feature(enable = "neon")]
+#[inline]
 #[allow(clippy::too_many_arguments)]
+fn v8_neon(
+    u: &mut [u8],
+    v: &mut [u8],
+    p: usize,
+    stride: usize,
+    thresh: u8,
+    ithresh: u8,
+    hev: u8,
+) {
+    let at = p - 4 * stride;
+    let (mut u, mut v) = (Rows::new(u, at, stride), Rows::new(v, at, stride));
+    let [p3, mut p2, mut p1, mut p0, mut q0, mut q1, mut q2, q3] = load_uv(&u, &v);
+    let mask = needs_filter2(p3, p2, p1, p0, q0, q1, q2, q3, thresh, ithresh);
+    let hev_mask = needs_hev(p1, p0, q0, q1, hev);
+    do_filter6(
+        &mut p2, &mut p1, &mut p0, &mut q0, &mut q1, &mut q2, mask, hev_mask,
+    );
+    store_uv(&mut u, &mut v, 1, [p2, p1, p0, q0, q1, q2]);
+}
+
+#[allow(unsafe_code)]
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
 pub(crate) fn h8(
     u: &mut [u8],
     v: &mut [u8],
@@ -450,21 +481,38 @@ pub(crate) fn h8(
     ithresh: u8,
     hev: u8,
 ) {
-    check(u.len(), p, 4, 7 * stride + 4);
-    check(v.len(), p, 4, 7 * stride + 4);
-    unsafe {
-        let (u, v) = (u.as_mut_ptr().add(p - 4), v.as_mut_ptr().add(p - 4));
-        let [p3, mut p2, mut p1, mut p0, mut q0, mut q1, mut q2, q3] = load8x16t(u, v, stride);
-        let mask = needs_filter2(p3, p2, p1, p0, q0, q1, q2, q3, thresh, ithresh);
-        let hev_mask = needs_hev(p1, p0, q0, q1, hev);
-        do_filter6(
-            &mut p2, &mut p1, &mut p0, &mut q0, &mut q1, &mut q2, mask, hev_mask,
-        );
-        store8x16t([p3, p2, p1, p0, q0, q1, q2, q3], u, v, stride);
-    }
+    // SAFETY: NEON is part of aarch64.
+    unsafe { h8_neon(u, v, p, stride, thresh, ithresh, hev) }
 }
 
+#[target_feature(enable = "neon")]
+#[inline]
 #[allow(clippy::too_many_arguments)]
+fn h8_neon(
+    u: &mut [u8],
+    v: &mut [u8],
+    p: usize,
+    stride: usize,
+    thresh: u8,
+    ithresh: u8,
+    hev: u8,
+) {
+    let at = p - 4;
+    let [p3, mut p2, mut p1, mut p0, mut q0, mut q1, mut q2, q3] =
+        columns(load_rows(u, at, stride), load_rows(v, at, stride));
+    let mask = needs_filter2(p3, p2, p1, p0, q0, q1, q2, q3, thresh, ithresh);
+    let hev_mask = needs_hev(p1, p0, q0, q1, hev);
+    do_filter6(
+        &mut p2, &mut p1, &mut p0, &mut q0, &mut q1, &mut q2, mask, hev_mask,
+    );
+    let (ru, rv) = rows([p3, p2, p1, p0, q0, q1, q2, q3]);
+    store_rows(u, at, stride, ru);
+    store_rows(v, at, stride, rv);
+}
+
+#[allow(unsafe_code)]
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
 pub(crate) fn v8i(
     u: &mut [u8],
     v: &mut [u8],
@@ -474,23 +522,33 @@ pub(crate) fn v8i(
     ithresh: u8,
     hev: u8,
 ) {
-    check(u.len(), p, 0, 7 * stride + 8);
-    check(v.len(), p, 0, 7 * stride + 8);
-    unsafe {
-        let (u, v) = (u.as_mut_ptr().add(p), v.as_mut_ptr().add(p));
-        let row = |k: usize| load_uv(u.add(k * stride), v.add(k * stride));
-        let (p3, p2, mut p1, mut p0) = (row(0), row(1), row(2), row(3));
-        let (mut q0, mut q1, q2, q3) = (row(4), row(5), row(6), row(7));
-        let mask = needs_filter2(p3, p2, p1, p0, q0, q1, q2, q3, thresh, ithresh);
-        let hev_mask = needs_hev(p1, p0, q0, q1, hev);
-        do_filter4(&mut p1, &mut p0, &mut q0, &mut q1, mask, hev_mask);
-        for (k, x) in [(2usize, p1), (3, p0), (4, q0), (5, q1)] {
-            store_uv(x, u.add(k * stride), v.add(k * stride));
-        }
-    }
+    // SAFETY: NEON is part of aarch64.
+    unsafe { v8i_neon(u, v, p, stride, thresh, ithresh, hev) }
 }
 
+#[target_feature(enable = "neon")]
+#[inline]
 #[allow(clippy::too_many_arguments)]
+fn v8i_neon(
+    u: &mut [u8],
+    v: &mut [u8],
+    p: usize,
+    stride: usize,
+    thresh: u8,
+    ithresh: u8,
+    hev: u8,
+) {
+    let (mut u, mut v) = (Rows::new(u, p, stride), Rows::new(v, p, stride));
+    let [p3, p2, mut p1, mut p0, mut q0, mut q1, q2, q3] = load_uv(&u, &v);
+    let mask = needs_filter2(p3, p2, p1, p0, q0, q1, q2, q3, thresh, ithresh);
+    let hev_mask = needs_hev(p1, p0, q0, q1, hev);
+    do_filter4(&mut p1, &mut p0, &mut q0, &mut q1, mask, hev_mask);
+    store_uv(&mut u, &mut v, 2, [p1, p0, q0, q1]);
+}
+
+#[allow(unsafe_code)]
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
 pub(crate) fn h8i(
     u: &mut [u8],
     v: &mut [u8],
@@ -500,26 +558,41 @@ pub(crate) fn h8i(
     ithresh: u8,
     hev: u8,
 ) {
-    check(u.len(), p, 0, 7 * stride + 8);
-    check(v.len(), p, 0, 7 * stride + 8);
-    unsafe {
-        let (u, v) = (u.as_mut_ptr().add(p), v.as_mut_ptr().add(p));
-        let [p3, p2, mut p1, mut p0, mut q0, mut q1, q2, q3] = load8x16t(u, v, stride);
-        let mask = needs_filter2(p3, p2, p1, p0, q0, q1, q2, q3, thresh, ithresh);
-        let hev_mask = needs_hev(p1, p0, q0, q1, hev);
-        do_filter4(&mut p1, &mut p0, &mut q0, &mut q1, mask, hev_mask);
-        store8x16t([p3, p2, p1, p0, q0, q1, q2, q3], u, v, stride);
-    }
+    // SAFETY: NEON is part of aarch64.
+    unsafe { h8i_neon(u, v, p, stride, thresh, ithresh, hev) }
+}
+
+#[target_feature(enable = "neon")]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn h8i_neon(
+    u: &mut [u8],
+    v: &mut [u8],
+    p: usize,
+    stride: usize,
+    thresh: u8,
+    ithresh: u8,
+    hev: u8,
+) {
+    let [p3, p2, mut p1, mut p0, mut q0, mut q1, q2, q3] =
+        columns(load_rows(u, p, stride), load_rows(v, p, stride));
+    let mask = needs_filter2(p3, p2, p1, p0, q0, q1, q2, q3, thresh, ithresh);
+    let hev_mask = needs_hev(p1, p0, q0, q1, hev);
+    do_filter4(&mut p1, &mut p0, &mut q0, &mut q1, mask, hev_mask);
+    let (ru, rv) = rows([p3, p2, p1, p0, q0, q1, q2, q3]);
+    store_rows(u, p, stride, ru);
+    store_rows(v, p, stride, rv);
 }
 
 /// libwebp's `CONVERT8` of `upsampling_neon.c`: 8 pixels to R, G, B. The samples are
 /// shifted up by 7 so that `vqdmulh` (`2 * a * b >> 16`) gives libwebp's `MultHi`, and
 /// `u * 33050 >> 8` is `u << 7` plus `u * 282 >> 8`.
-#[inline(always)]
-unsafe fn yuv444_to_rgb(y: *const u8, u: *const u8, v: *const u8) -> [uint8x8_t; 3] {
-    let y0 = vreinterpretq_s16_u16(vshll_n_u8::<7>(vld1_u8(y)));
-    let u0 = vreinterpretq_s16_u16(vshll_n_u8::<7>(vld1_u8(u)));
-    let v0 = vreinterpretq_s16_u16(vshll_n_u8::<7>(vld1_u8(v)));
+#[target_feature(enable = "neon")]
+#[inline]
+fn yuv444_to_rgb(y: uint8x8_t, u: uint8x8_t, v: uint8x8_t) -> [uint8x8_t; 3] {
+    let y0 = vreinterpretq_s16_u16(vshll_n_u8::<7>(y));
+    let u0 = vreinterpretq_s16_u16(vshll_n_u8::<7>(u));
+    let v0 = vreinterpretq_s16_u16(vshll_n_u8::<7>(v));
     let y1 = vqdmulhq_n_s16(y0, 19077);
     let r0 = vqdmulhq_n_s16(v0, 26149);
     let g0 = vqdmulhq_n_s16(u0, 6419);
@@ -535,49 +608,79 @@ unsafe fn yuv444_to_rgb(y: *const u8, u: *const u8, v: *const u8) -> [uint8x8_t;
     ]
 }
 
+/// `yuv444_to_rgb` of 16 pixels.
+#[target_feature(enable = "neon")]
+#[inline]
+fn yuv444_to_rgb16(y: &[u8; 16], u: &[u8; 16], v: &[u8; 16]) -> [uint8x16_t; 3] {
+    let lo = |s: &[u8; 16]| load::<uint8x8_t, _>(&s[..8]);
+    let hi = |s: &[u8; 16]| load::<uint8x8_t, _>(&s[8..]);
+    let [r0, g0, b0] = yuv444_to_rgb(lo(y), lo(u), lo(v));
+    let [r1, g1, b1] = yuv444_to_rgb(hi(y), hi(u), hi(v));
+    [
+        vcombine_u8(r0, r1),
+        vcombine_u8(g0, g1),
+        vcombine_u8(b0, b1),
+    ]
+}
+
 /// RGB (`BPP` 3) or RGBA with alpha 255 (`BPP` 4) of the leading pixels of a row with
 /// full-width chroma, 16 or 8 pixels at a time. Returns how many pixels it converted.
+#[allow(unsafe_code)]
+#[inline(always)]
 pub(crate) fn yuv_to_rgb_row<const BPP: usize>(
     y: &[u8],
     u: &[u8],
     v: &[u8],
     out: &mut [u8],
 ) -> usize {
+    // SAFETY: NEON is part of aarch64.
+    unsafe { yuv_to_rgb_row_neon::<BPP>(y, u, v, out) }
+}
+
+#[target_feature(enable = "neon")]
+#[inline]
+fn yuv_to_rgb_row_neon<const BPP: usize>(
+    y: &[u8],
+    u: &[u8],
+    v: &[u8],
+    out: &mut [u8],
+) -> usize {
     let n = y.len().min(u.len()).min(v.len()).min(out.len() / BPP);
-    let mut i = 0;
-    unsafe {
-        let (y, u, v, out) = (y.as_ptr(), u.as_ptr(), v.as_ptr(), out.as_mut_ptr());
-        while i + 16 <= n {
-            let [r0, g0, b0] = yuv444_to_rgb(y.add(i), u.add(i), v.add(i));
-            let [r1, g1, b1] = yuv444_to_rgb(y.add(i + 8), u.add(i + 8), v.add(i + 8));
-            let (r, g, b) = (
-                vcombine_u8(r0, r1),
-                vcombine_u8(g0, g1),
-                vcombine_u8(b0, b1),
-            );
-            if BPP == 3 {
-                vst3q_u8(out.add(3 * i), uint8x16x3_t(r, g, b));
-            } else {
-                vst4q_u8(out.add(4 * i), uint8x16x4_t(r, g, b, vdupq_n_u8(255)));
-            }
-            i += 16;
+    let m = n & !15;
+    let (y16, u16, v16) = (
+        y.as_chunks::<16>().0,
+        u.as_chunks::<16>().0,
+        v.as_chunks::<16>().0,
+    );
+    let blocks = y16.iter().zip(u16.iter().zip(v16));
+    if BPP == 3 {
+        for (o, (y, (u, v))) in out.as_chunks_mut::<48>().0.iter_mut().zip(blocks) {
+            let [r, g, b] = yuv444_to_rgb16(y, u, v);
+            neon::vst3q_u8(o, uint8x16x3_t(r, g, b));
         }
-        while i + 8 <= n {
-            let [r, g, b] = yuv444_to_rgb(y.add(i), u.add(i), v.add(i));
-            if BPP == 3 {
-                vst3_u8(out.add(3 * i), uint8x8x3_t(r, g, b));
-            } else {
-                vst4_u8(out.add(4 * i), uint8x8x4_t(r, g, b, vdup_n_u8(255)));
-            }
-            i += 8;
+    } else {
+        for (o, (y, (u, v))) in out.as_chunks_mut::<64>().0.iter_mut().zip(blocks) {
+            let [r, g, b] = yuv444_to_rgb16(y, u, v);
+            neon::vst4q_u8(o, uint8x16x4_t(r, g, b, vdupq_n_u8(255)));
         }
     }
-    i
+    if m + 8 > n {
+        return m;
+    }
+    let [r, g, b] = yuv444_to_rgb(load_at(y, m), load_at(u, m), load_at(v, m));
+    let o = &mut out[BPP * m..];
+    if BPP == 3 {
+        neon::vst3_u8(o, uint8x8x3_t(r, g, b));
+    } else {
+        neon::vst4_u8(o, uint8x8x4_t(r, g, b, vdup_n_u8(255)));
+    }
+    m + 8
 }
 
 /// A 4x4 transpose of 16-bit lanes.
-#[inline(always)]
-unsafe fn transpose4x4(r: [int16x4_t; 4]) -> [int16x4_t; 4] {
+#[target_feature(enable = "neon")]
+#[inline]
+fn transpose4x4(r: [int16x4_t; 4]) -> [int16x4_t; 4] {
     let a = vtrn_s16(r[0], r[1]);
     let b = vtrn_s16(r[2], r[3]);
     let c = vtrn_s32(vreinterpret_s32_s16(a.0), vreinterpret_s32_s16(b.0));
@@ -592,8 +695,9 @@ unsafe fn transpose4x4(r: [int16x4_t; 4]) -> [int16x4_t; 4] {
 
 /// One pass of libwebp's `TransformPass_NEON`, saturating: `x * 35468 >> 16` is `vqdmulh` by
 /// 17734, and `x + (x * 20091 >> 16)` adds half of `vqdmulh` by 20091.
-#[inline(always)]
-unsafe fn transform_pass(i: [int16x4_t; 4]) -> [int16x4_t; 4] {
+#[target_feature(enable = "neon")]
+#[inline]
+fn transform_pass(i: [int16x4_t; 4]) -> [int16x4_t; 4] {
     let mul1 = |x: int16x4_t| vsra_n_s16::<1>(x, vqdmulh_n_s16(x, 20091));
     let mul2 = |x: int16x4_t| vqdmulh_n_s16(x, 17734);
     let a = vqadd_s16(i[0], i[2]);
@@ -608,121 +712,138 @@ unsafe fn transform_pass(i: [int16x4_t; 4]) -> [int16x4_t; 4] {
     ]
 }
 
-#[inline(always)]
-unsafe fn load4(p: *const u8) -> uint8x8_t {
-    vreinterpret_u8_u32(vdup_n_u32(p.cast::<u32>().read_unaligned()))
+#[target_feature(enable = "neon")]
+#[inline]
+fn widen4(x: u32) -> uint8x8_t {
+    vreinterpret_u8_u32(vdup_n_u32(x))
 }
 
-#[inline(always)]
-unsafe fn store4(p: *mut u8, x: uint8x8_t) {
-    p.cast::<u32>()
-        .write_unaligned(vget_lane_u32::<0>(vreinterpret_u32_u8(x)));
+#[target_feature(enable = "neon")]
+#[inline]
+fn narrow4(x: uint8x8_t) -> u32 {
+    vget_lane_u32::<0>(vreinterpret_u32_u8(x))
 }
 
-/// `t` added to the 4 pixels at `p`, saturated to 8 bits.
-#[inline(always)]
-unsafe fn add_row(p: *mut u8, t: int16x4_t) {
-    let d = vreinterpret_s16_u16(vget_low_u16(vmovl_u8(load4(p))));
+/// `t` added to the 4 pixels `x`, saturated to 8 bits.
+#[target_feature(enable = "neon")]
+#[inline]
+fn add_row(x: u32, t: int16x4_t) -> u32 {
+    let d = vreinterpret_s16_u16(vget_low_u16(vmovl_u8(widen4(x))));
     let s = vadd_s16(d, t);
-    store4(p, vqmovun_s16(vcombine_s16(s, s)));
+    narrow4(vqmovun_s16(vcombine_s16(s, s)))
+}
+
+/// `t` added to the 4x4 pixels at `pos` of `dst`, each row rounded and shifted by 3.
+#[target_feature(enable = "neon")]
+#[inline]
+fn add_rows(dst: &mut [u8], pos: usize, stride: usize, t: [int16x4_t; 4]) {
+    let px = load_rows::<u32, 4>(dst, pos, stride);
+    let px: [u32; 4] = core::array::from_fn(|k| add_row(px[k], vrshr_n_s16::<3>(t[k])));
+    store_rows(dst, pos, stride, px);
 }
 
 /// libwebp's `TransformOne_NEON`: the inverse transform of `block` (16 coefficients that fit 16
 /// bits) in saturating 16 bits, added to the 4x4 pixels at `pos` of `dst`.
+#[allow(unsafe_code)]
+#[inline(always)]
 pub(crate) fn transform_add(block: &[i16], dst: &mut [u8], pos: usize, stride: usize) {
+    // SAFETY: NEON is part of aarch64.
+    unsafe { transform_add_neon(block, dst, pos, stride) }
+}
+
+#[target_feature(enable = "neon")]
+#[inline]
+fn transform_add_neon(block: &[i16], dst: &mut [u8], pos: usize, stride: usize) {
     let block = &block[..16];
-    check(dst.len(), pos, 0, 3 * stride + 4);
-    unsafe {
-        let row = |r: usize| vld1_s16(block.as_ptr().add(4 * r));
-        let t = transpose4x4(transform_pass([row(0), row(1), row(2), row(3)]));
-        let t = transpose4x4(transform_pass(t));
-        let p = dst.as_mut_ptr().add(pos);
-        for (k, t) in t.into_iter().enumerate() {
-            add_row(p.add(k * stride), vrshr_n_s16::<3>(t));
-        }
-    }
+    let t = transpose4x4(transform_pass(core::array::from_fn(|r| load_at(block, 4 * r))));
+    add_rows(dst, pos, stride, transpose4x4(transform_pass(t)));
 }
 
 /// libwebp's `TransformAC3_NEON`: the inverse transform of `block`, whose only coefficients are
 /// 0, 1 and 4, in saturating 16 bits, added to the 4x4 pixels at `pos` of `dst`.
+#[allow(unsafe_code)]
+#[inline(always)]
 pub(crate) fn transform_ac3_add(block: &[i16], dst: &mut [u8], pos: usize, stride: usize) {
+    // SAFETY: NEON is part of aarch64.
+    unsafe { transform_ac3_add_neon(block, dst, pos, stride) }
+}
+
+#[target_feature(enable = "neon")]
+#[inline]
+fn transform_ac3_add_neon(block: &[i16], dst: &mut [u8], pos: usize, stride: usize) {
     let block = &block[..16];
-    check(dst.len(), pos, 0, 3 * stride + 4);
     let mul1 = |a: i16| (((i32::from(a) * 20091) >> 16) + i32::from(a)) as i16;
     let mul2 = |a: i16| ((i32::from(a) * 35468) >> 16) as i16;
     let (c1, d1) = (mul2(block[1]), mul1(block[1]));
     let cd = [d1, c1, c1.wrapping_neg(), d1.wrapping_neg()];
-    unsafe {
-        let b = vqadd_s16(vdup_n_s16(block[0]), vld1_s16(cd.as_ptr()));
-        let (c4, d4) = (vdup_n_s16(mul2(block[4])), vdup_n_s16(mul1(block[4])));
-        let rows = [
-            vqadd_s16(b, d4),
-            vqadd_s16(b, c4),
-            vqsub_s16(b, c4),
-            vqsub_s16(b, d4),
-        ];
-        let p = dst.as_mut_ptr().add(pos);
-        for (k, t) in rows.into_iter().enumerate() {
-            add_row(p.add(k * stride), vrshr_n_s16::<3>(t));
-        }
-    }
+    let b = vqadd_s16(vdup_n_s16(block[0]), load(&cd));
+    let (c4, d4) = (vdup_n_s16(mul2(block[4])), vdup_n_s16(mul1(block[4])));
+    let rows = [
+        vqadd_s16(b, d4),
+        vqadd_s16(b, c4),
+        vqsub_s16(b, c4),
+        vqsub_s16(b, d4),
+    ];
+    add_rows(dst, pos, stride, rows);
 }
 
 /// The interpolated pixels `out[2 * j + 1]` and `out[2 * j + 2]` of the leading chroma pairs
 /// `j` of `upsample_chroma_row`, 16 or 8 pairs at a time in 8 bits as libwebp's
 /// `UPSAMPLE_16PIXELS`. Returns how many pairs it did.
+#[allow(unsafe_code)]
+#[inline(always)]
 pub(crate) fn upsample_pairs(near: &[u8], far: &[u8], out: &mut [u8]) -> usize {
+    // SAFETY: NEON is part of aarch64.
+    unsafe { upsample_pairs_neon(near, far, out) }
+}
+
+#[target_feature(enable = "neon")]
+#[inline]
+fn upsample_pairs_neon(near: &[u8], far: &[u8], out: &mut [u8]) -> usize {
     let n = near.len().min(far.len());
     let pairs = (out.len().saturating_sub(1) / 2).min(n.saturating_sub(1));
-    let mut j = 0;
-    unsafe {
-        let one = vdupq_n_u8(1);
-        let pairs16 = |a: uint8x16_t, b: uint8x16_t, c: uint8x16_t, d: uint8x16_t| {
-            let s = vrhaddq_u8(a, d);
-            let t = vrhaddq_u8(b, c);
-            let st = veorq_u8(s, t);
-            let ad = veorq_u8(a, d);
-            let bc = veorq_u8(b, c);
-            let lsb = vandq_u8(vorrq_u8(vorrq_u8(ad, bc), st), one);
-            let k = vsubq_u8(vrhaddq_u8(s, t), lsb);
-            let get_m = |ij: uint8x16_t, x: uint8x16_t| {
-                let lsb = vandq_u8(vorrq_u8(vandq_u8(ij, st), veorq_u8(k, x)), one);
-                vsubq_u8(vrhaddq_u8(k, x), lsb)
-            };
-            uint8x16x2_t(vrhaddq_u8(a, get_m(bc, t)), vrhaddq_u8(b, get_m(ad, s)))
-        };
-        let (near, far, out) = (near.as_ptr(), far.as_ptr(), out.as_mut_ptr());
-        while j + 16 <= pairs && j + 17 <= n {
-            let eo = pairs16(
-                load16(near.add(j)),
-                load16(near.add(j + 1)),
-                load16(far.add(j)),
-                load16(far.add(j + 1)),
-            );
-            vst2q_u8(out.add(2 * j + 1), eo);
-            j += 16;
-        }
-        if j + 8 <= pairs && j + 9 <= n {
-            let half = |p: *const u8| vcombine_u8(vld1_u8(p), vdup_n_u8(0));
-            let eo = pairs16(
-                half(near.add(j)),
-                half(near.add(j + 1)),
-                half(far.add(j)),
-                half(far.add(j + 1)),
-            );
-            vst2_u8(
-                out.add(2 * j + 1),
-                uint8x8x2_t(vget_low_u8(eo.0), vget_low_u8(eo.1)),
-            );
-            j += 8;
-        }
+    if pairs < 8 {
+        return 0;
     }
-    j
+    let one = vdupq_n_u8(1);
+    let pairs16 = |a: uint8x16_t, b: uint8x16_t, c: uint8x16_t, d: uint8x16_t| {
+        let s = vrhaddq_u8(a, d);
+        let t = vrhaddq_u8(b, c);
+        let st = veorq_u8(s, t);
+        let ad = veorq_u8(a, d);
+        let bc = veorq_u8(b, c);
+        let lsb = vandq_u8(vorrq_u8(vorrq_u8(ad, bc), st), one);
+        let k = vsubq_u8(vrhaddq_u8(s, t), lsb);
+        let get_m = |ij: uint8x16_t, x: uint8x16_t| {
+            let lsb = vandq_u8(vorrq_u8(vandq_u8(ij, st), veorq_u8(k, x)), one);
+            vsubq_u8(vrhaddq_u8(k, x), lsb)
+        };
+        uint8x16x2_t(vrhaddq_u8(a, get_m(bc, t)), vrhaddq_u8(b, get_m(ad, s)))
+    };
+    let m = pairs & !15;
+    let (a, b) = (near.as_chunks::<16>().0, near[1..].as_chunks::<16>().0);
+    let (c, d) = (far.as_chunks::<16>().0, far[1..].as_chunks::<16>().0);
+    let o = out[1..].as_chunks_mut::<32>().0;
+    for (o, (a, (b, (c, d)))) in o.iter_mut().zip(a.iter().zip(b.iter().zip(c.iter().zip(d)))) {
+        neon::vst2q_u8(o, pairs16(load(a), load(b), load(c), load(d)));
+    }
+    if m + 8 > pairs {
+        return m;
+    }
+    let half = |s: &[u8], at: usize| vcombine_u8(load_at(s, at), vdup_n_u8(0));
+    let eo = pairs16(half(near, m), half(near, m + 1), half(far, m), half(far, m + 1));
+    neon::vst2_u8(
+        &mut out[2 * m + 1..],
+        uint8x8x2_t(vget_low_u8(eo.0), vget_low_u8(eo.1)),
+    );
+    m + 8
 }
 
 /// libwebp's `DC16`, `DC8uv` and their `NoTop`, `NoLeft` and `NoTopLeft` variants: a
 /// `SIZE`x`SIZE` block (8 or 16) at `p` set to the rounded mean of the row above and the
 /// column to the left, as far as they are given.
+#[allow(unsafe_code)]
+#[inline(always)]
 pub(crate) fn dc<const SIZE: usize>(
     buf: &mut [u8],
     p: usize,
@@ -730,196 +851,250 @@ pub(crate) fn dc<const SIZE: usize>(
     top: bool,
     left: bool,
 ) {
-    check(buf.len(), p, stride + 1, (SIZE - 1) * stride + SIZE);
-    unsafe {
-        let dst = buf.as_mut_ptr().add(p);
-        let shift = SIZE.trailing_zeros() - 1;
-        let mut sum = 0;
-        if top {
-            sum += if SIZE == 8 {
-                u32::from(vaddlv_u8(vld1_u8(dst.sub(stride))))
-            } else {
-                u32::from(vaddlvq_u8(load16(dst.sub(stride))))
-            };
-        }
-        if left {
-            for y in 0..SIZE {
-                sum += u32::from(*dst.add(y * stride).sub(1));
-            }
-        }
-        let dc = match (top, left) {
-            (true, true) => (sum + SIZE as u32) >> (shift + 2),
-            (false, false) => 128,
-            _ => (sum + SIZE as u32 / 2) >> (shift + 1),
+    // SAFETY: NEON is part of aarch64.
+    unsafe { dc_neon::<SIZE>(buf, p, stride, top, left) }
+}
+
+#[target_feature(enable = "neon")]
+#[inline]
+fn dc_neon<const SIZE: usize>(buf: &mut [u8], p: usize, stride: usize, top: bool, left: bool) {
+    let shift = SIZE.trailing_zeros() - 1;
+    let mut sum = 0;
+    if top {
+        sum += if SIZE == 8 {
+            u32::from(vaddlv_u8(load_at(buf, p - stride)))
+        } else {
+            u32::from(vaddlvq_u8(load_at(buf, p - stride)))
         };
-        let v = vdupq_n_u8(dc as u8);
-        for y in 0..SIZE {
-            if SIZE == 8 {
-                vst1_u8(dst.add(y * stride), vget_low_u8(v));
-            } else {
-                store16(dst.add(y * stride), v);
-            }
-        }
+    }
+    if left {
+        let col = Rows::<SIZE, 1>::new(buf, p - 1, stride);
+        sum += (0..SIZE).map(|y| u32::from(col.load::<u8>(y, 0))).sum::<u32>();
+    }
+    let dc = match (top, left) {
+        (true, true) => (sum + SIZE as u32) >> (shift + 2),
+        (false, false) => 128,
+        _ => (sum + SIZE as u32 / 2) >> (shift + 1),
+    };
+    let v = vdupq_n_u8(dc as u8);
+    if SIZE == 8 {
+        store_rows(buf, p, stride, [vget_low_u8(v); SIZE]);
+    } else {
+        store_rows(buf, p, stride, [v; SIZE]);
     }
 }
 
 /// libwebp's `TransformDC`: `dc` (the DC coefficient plus rounding, shifted) added to the
 /// 4x4 pixels at `pos` of `dst`.
+#[allow(unsafe_code)]
+#[inline(always)]
 pub(crate) fn add_dc(dc: i32, dst: &mut [u8], pos: usize, stride: usize) {
-    check(dst.len(), pos, 0, 3 * stride + 4);
-    unsafe {
-        let dc = vdup_n_s16(dc as i16);
-        let p = dst.as_mut_ptr().add(pos);
-        for k in 0..4 {
-            add_row(p.add(k * stride), dc);
-        }
-    }
+    // SAFETY: NEON is part of aarch64.
+    unsafe { add_dc_neon(dc, dst, pos, stride) }
+}
+
+#[target_feature(enable = "neon")]
+#[inline]
+fn add_dc_neon(dc: i32, dst: &mut [u8], pos: usize, stride: usize) {
+    let dc = vdup_n_s16(dc as i16);
+    let px = load_rows::<u32, 4>(dst, pos, stride);
+    store_rows(dst, pos, stride, px.map(|x| add_row(x, dc)));
 }
 
 /// `(a + 2 * b + c + 2) >> 2` per byte, as libwebp's predictors compute it.
-#[inline(always)]
-unsafe fn avg3(a: uint8x8_t, b: uint8x8_t, c: uint8x8_t) -> uint8x8_t {
+#[target_feature(enable = "neon")]
+#[inline]
+fn avg3(a: uint8x8_t, b: uint8x8_t, c: uint8x8_t) -> uint8x8_t {
     vrhadd_u8(vhadd_u8(a, c), b)
 }
 
 /// The bytes of `x` from `N` on, zeros shifted in.
-#[inline(always)]
-unsafe fn shr<const N: i32>(x: uint8x8_t) -> uint8x8_t {
+#[target_feature(enable = "neon")]
+#[inline]
+fn shr<const N: i32>(x: uint8x8_t) -> uint8x8_t {
     vext_u8::<N>(x, vdup_n_u8(0))
 }
 
-/// Checks the bounds of a 4x4 prediction at `p` that reads the row above from one pixel to
-/// its left on and 8 bytes wide.
-#[inline(always)]
-fn check4(len: usize, p: usize, stride: usize) {
-    check(len, p, stride + 1, 3 * stride + 4);
+/// The low 4 bytes of each of `rows` to the 4x4 block at `p`.
+#[target_feature(enable = "neon")]
+#[inline]
+fn store4x4(buf: &mut [u8], p: usize, stride: usize, rows: [uint8x8_t; 4]) {
+    store_rows(buf, p, stride, rows.map(|x| narrow4(x)));
 }
 
 /// libwebp's `VE4`.
+#[allow(unsafe_code)]
+#[inline(always)]
 pub(crate) fn ve4(buf: &mut [u8], p: usize, stride: usize) {
-    check4(buf.len(), p, stride);
-    unsafe {
-        let dst = buf.as_mut_ptr().add(p);
-        let t = vld1_u8(dst.sub(stride + 1));
-        let avg = avg3(t, shr::<1>(t), shr::<2>(t));
-        for y in 0..4 {
-            store4(dst.add(y * stride), avg);
-        }
-    }
+    // SAFETY: NEON is part of aarch64.
+    unsafe { ve4_neon(buf, p, stride) }
+}
+
+#[target_feature(enable = "neon")]
+#[inline]
+fn ve4_neon(buf: &mut [u8], p: usize, stride: usize) {
+    let t = load_at(buf, p - stride - 1);
+    let avg = avg3(t, shr::<1>(t), shr::<2>(t));
+    store4x4(buf, p, stride, [avg; 4]);
 }
 
 /// libwebp's `LD4`.
+#[allow(unsafe_code)]
+#[inline(always)]
 pub(crate) fn ld4(buf: &mut [u8], p: usize, stride: usize) {
-    check4(buf.len(), p, stride);
-    unsafe {
-        let dst = buf.as_mut_ptr().add(p);
-        let top = dst.sub(stride);
-        let t = vld1_u8(top);
-        let c = vext_u8::<2>(t, vdup_n_u8(*top.add(7)));
-        let avg = avg3(t, shr::<1>(t), c);
-        store4(dst, avg);
-        store4(dst.add(stride), shr::<1>(avg));
-        store4(dst.add(2 * stride), shr::<2>(avg));
-        store4(dst.add(3 * stride), shr::<3>(avg));
-    }
+    // SAFETY: NEON is part of aarch64.
+    unsafe { ld4_neon(buf, p, stride) }
+}
+
+#[target_feature(enable = "neon")]
+#[inline]
+fn ld4_neon(buf: &mut [u8], p: usize, stride: usize) {
+    let t = load_at(buf, p - stride);
+    let c = vext_u8::<2>(t, vdup_lane_u8::<7>(t));
+    let avg = avg3(t, shr::<1>(t), c);
+    store4x4(
+        buf,
+        p,
+        stride,
+        [avg, shr::<1>(avg), shr::<2>(avg), shr::<3>(avg)],
+    );
 }
 
 /// libwebp's `RD4`.
+#[allow(unsafe_code)]
+#[inline(always)]
 pub(crate) fn rd4(buf: &mut [u8], p: usize, stride: usize) {
-    check4(buf.len(), p, stride);
-    unsafe {
-        let dst = buf.as_mut_ptr().add(p);
-        let left = |y: usize| u32::from(*dst.add(y * stride).sub(1));
-        let lkji = left(3) | (left(2) << 8) | (left(1) << 16) | (left(0) << 24);
-        // L K J I X A B C D ...
-        let xabcd = vld1_u8(dst.sub(stride + 1));
-        let e = vcombine_u8(vreinterpret_u8_u32(vdup_n_u32(lkji)), xabcd);
-        let e = vextq_u8::<4>(e, e);
-        let a = vrhaddq_u8(vhaddq_u8(e, vextq_u8::<2>(e, e)), vextq_u8::<1>(e, e));
-        let lane = |x: uint8x16_t| vget_low_u8(x);
-        store4(dst.add(3 * stride), lane(a));
-        store4(dst.add(2 * stride), lane(vextq_u8::<1>(a, a)));
-        store4(dst.add(stride), lane(vextq_u8::<2>(a, a)));
-        store4(dst, lane(vextq_u8::<3>(a, a)));
-    }
+    // SAFETY: NEON is part of aarch64.
+    unsafe { rd4_neon(buf, p, stride) }
+}
+
+#[target_feature(enable = "neon")]
+#[inline]
+fn rd4_neon(buf: &mut [u8], p: usize, stride: usize) {
+    let [i, j, k, l] = load_rows::<u8, 4>(buf, p - 1, stride).map(u32::from);
+    let lkji = l | (k << 8) | (j << 16) | (i << 24);
+    // L K J I X A B C D ...
+    let xabcd = load_at(buf, p - stride - 1);
+    let e = vcombine_u8(widen4(lkji), xabcd);
+    let e = vextq_u8::<4>(e, e);
+    let a = vrhaddq_u8(vhaddq_u8(e, vextq_u8::<2>(e, e)), vextq_u8::<1>(e, e));
+    let lane = |x: uint8x16_t| vget_low_u8(x);
+    store4x4(
+        buf,
+        p,
+        stride,
+        [
+            lane(vextq_u8::<3>(a, a)),
+            lane(vextq_u8::<2>(a, a)),
+            lane(vextq_u8::<1>(a, a)),
+            lane(a),
+        ],
+    );
 }
 
 /// libwebp's `VR4`.
+#[allow(unsafe_code)]
+#[inline(always)]
 pub(crate) fn vr4(buf: &mut [u8], p: usize, stride: usize) {
-    check4(buf.len(), p, stride);
-    unsafe {
-        let dst = buf.as_mut_ptr().add(p);
-        let (i, j, k) = (
-            *dst.sub(1),
-            *dst.add(stride).sub(1),
-            *dst.add(2 * stride).sub(1),
-        );
-        let x = *dst.sub(stride + 1);
-        let xabcd = vld1_u8(dst.sub(stride + 1));
-        let abcd0 = shr::<1>(xabcd);
-        let abcd = vrhadd_u8(xabcd, abcd0);
-        let ixabcd = vext_u8::<7>(vdup_n_u8(i), xabcd);
-        let efgh = avg3(ixabcd, xabcd, abcd0);
-        let zero = vdup_n_u8(0);
-        store4(dst, abcd);
-        store4(dst.add(stride), efgh);
-        store4(dst.add(2 * stride), vext_u8::<7>(zero, abcd));
-        store4(dst.add(3 * stride), vext_u8::<7>(zero, efgh));
-        let avg3_1 =
-            |a: u8, b: u8, c: u8| ((u16::from(a) + 2 * u16::from(b) + u16::from(c) + 2) >> 2) as u8;
-        *dst.add(2 * stride) = avg3_1(j, i, x);
-        *dst.add(3 * stride) = avg3_1(k, j, i);
-    }
+    // SAFETY: NEON is part of aarch64.
+    unsafe { vr4_neon(buf, p, stride) }
+}
+
+#[target_feature(enable = "neon")]
+#[inline]
+fn vr4_neon(buf: &mut [u8], p: usize, stride: usize) {
+    let [x, i, j, k] = load_rows::<u8, 4>(buf, p - stride - 1, stride);
+    let xabcd = load_at(buf, p - stride - 1);
+    let abcd0 = shr::<1>(xabcd);
+    let abcd = vrhadd_u8(xabcd, abcd0);
+    let ixabcd = vext_u8::<7>(vdup_n_u8(i), xabcd);
+    let efgh = avg3(ixabcd, xabcd, abcd0);
+    let zero = vdup_n_u8(0);
+    store4x4(
+        buf,
+        p,
+        stride,
+        [abcd, efgh, vext_u8::<7>(zero, abcd), vext_u8::<7>(zero, efgh)],
+    );
+    let avg3_1 =
+        |a: u8, b: u8, c: u8| ((u16::from(a) + 2 * u16::from(b) + u16::from(c) + 2) >> 2) as u8;
+    store_rows(buf, p + 2 * stride, stride, [avg3_1(j, i, x), avg3_1(k, j, i)]);
 }
 
 /// libwebp's `VL4`.
+#[allow(unsafe_code)]
+#[inline(always)]
 pub(crate) fn vl4(buf: &mut [u8], p: usize, stride: usize) {
-    check4(buf.len(), p, stride);
-    unsafe {
-        let dst = buf.as_mut_ptr().add(p);
-        let one = vdup_n_u8(1);
-        let a = vld1_u8(dst.sub(stride));
-        let b = shr::<1>(a);
-        let c = shr::<2>(a);
-        let avg1 = vrhadd_u8(a, b);
-        let avg2 = vrhadd_u8(c, b);
-        let avg3 = vrhadd_u8(avg1, avg2);
-        let lsb1 = vand_u8(veor_u8(avg1, avg2), one);
-        let abbc = vorr_u8(veor_u8(a, b), veor_u8(c, b));
-        let avg4 = vqsub_u8(avg3, vand_u8(abbc, lsb1));
-        store4(dst, avg1);
-        store4(dst.add(stride), avg4);
-        store4(dst.add(2 * stride), shr::<1>(avg1));
-        store4(dst.add(3 * stride), shr::<1>(avg4));
-        *dst.add(2 * stride + 3) = vget_lane_u8::<4>(avg4);
-        *dst.add(3 * stride + 3) = vget_lane_u8::<5>(avg4);
-    }
+    // SAFETY: NEON is part of aarch64.
+    unsafe { vl4_neon(buf, p, stride) }
+}
+
+#[target_feature(enable = "neon")]
+#[inline]
+fn vl4_neon(buf: &mut [u8], p: usize, stride: usize) {
+    let one = vdup_n_u8(1);
+    let a = load_at(buf, p - stride);
+    let b = shr::<1>(a);
+    let c = shr::<2>(a);
+    let avg1 = vrhadd_u8(a, b);
+    let avg2 = vrhadd_u8(c, b);
+    let avg3 = vrhadd_u8(avg1, avg2);
+    let lsb1 = vand_u8(veor_u8(avg1, avg2), one);
+    let abbc = vorr_u8(veor_u8(a, b), veor_u8(c, b));
+    let avg4 = vqsub_u8(avg3, vand_u8(abbc, lsb1));
+    store4x4(
+        buf,
+        p,
+        stride,
+        [avg1, avg4, shr::<1>(avg1), shr::<1>(avg4)],
+    );
+    store_rows(
+        buf,
+        p + 2 * stride + 3,
+        stride,
+        [vget_lane_u8::<4>(avg4), vget_lane_u8::<5>(avg4)],
+    );
 }
 
 /// libwebp's `TrueMotion` of a `SIZE`x`SIZE` block (4, 8 or 16) at `p`.
+#[allow(unsafe_code)]
+#[inline(always)]
 pub(crate) fn tm<const SIZE: usize>(buf: &mut [u8], p: usize, stride: usize) {
-    check(buf.len(), p, stride + 1, (SIZE - 1) * stride + SIZE);
-    unsafe {
-        let mut dst = buf.as_mut_ptr().add(p);
-        let top = dst.sub(stride);
-        let corner = i16::from(*top.sub(1));
-        let t = match SIZE {
-            4 => vcombine_u8(load4(top), vdup_n_u8(0)),
-            8 => vcombine_u8(vld1_u8(top), vdup_n_u8(0)),
-            _ => load16(top),
-        };
-        let t0 = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(t)));
-        let t1 = vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(t)));
-        for _ in 0..SIZE {
-            let base = vdupq_n_s16(i16::from(*dst.sub(1)) - corner);
-            let lo = vqmovun_s16(vaddq_s16(base, t0));
-            match SIZE {
-                4 => store4(dst, lo),
-                8 => vst1_u8(dst, lo),
-                _ => store16(dst, vcombine_u8(lo, vqmovun_s16(vaddq_s16(base, t1)))),
-            }
-            dst = dst.add(stride);
-        }
+    // SAFETY: NEON is part of aarch64.
+    unsafe { tm_neon::<SIZE>(buf, p, stride) }
+}
+
+#[target_feature(enable = "neon")]
+#[inline]
+fn tm_neon<const SIZE: usize>(buf: &mut [u8], p: usize, stride: usize) {
+    let corner = i16::from(buf[p - stride - 1]);
+    let t = match SIZE {
+        4 => vcombine_u8(widen4(load_at(buf, p - stride)), vdup_n_u8(0)),
+        8 => vcombine_u8(load_at(buf, p - stride), vdup_n_u8(0)),
+        _ => load_at(buf, p - stride),
+    };
+    let t0 = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(t)));
+    let t1 = vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(t)));
+    let left = load_rows::<u8, SIZE>(buf, p - 1, stride);
+    let row = |y: usize| {
+        let base = vdupq_n_s16(i16::from(left[y]) - corner);
+        (
+            vqmovun_s16(vaddq_s16(base, t0)),
+            vqmovun_s16(vaddq_s16(base, t1)),
+        )
+    };
+    match SIZE {
+        4 => store_rows(buf, p, stride, core::array::from_fn::<_, SIZE, _>(|y| narrow4(row(y).0))),
+        8 => store_rows(buf, p, stride, core::array::from_fn::<_, SIZE, _>(|y| row(y).0)),
+        _ => store_rows(
+            buf,
+            p,
+            stride,
+            core::array::from_fn::<_, SIZE, _>(|y| {
+                let (lo, hi) = row(y);
+                vcombine_u8(lo, hi)
+            }),
+        ),
     }
 }
 
@@ -927,64 +1102,81 @@ pub(crate) fn tm<const SIZE: usize>(buf: &mut [u8], p: usize, stride: usize) {
 /// a running sum of the residuals and the top row's steps, for as long as no prediction
 /// needs clamping. Returns where it stopped: at a block that clamps or with fewer than 16
 /// pixels left.
-pub(crate) fn unfilter_gradient(prev: &[u8], row: &mut [u8], mut x: usize) -> usize {
-    let n = row.len().min(prev.len());
+#[allow(unsafe_code)]
+#[inline(always)]
+pub(crate) fn unfilter_gradient(prev: &[u8], row: &mut [u8], x: usize) -> usize {
+    // SAFETY: NEON is part of aarch64.
+    unsafe { unfilter_gradient_neon(prev, row, x) }
+}
+
+#[target_feature(enable = "neon")]
+#[inline]
+fn unfilter_gradient_neon(prev: &[u8], row: &mut [u8], mut x: usize) -> usize {
     assert!(x >= 1);
-    // SAFETY: the loads read prev[x - 1..x + 16] and row[x - 1..x + 16] and the store writes
-    // row[x..x + 16], in bounds for x + 16 <= n.
-    unsafe {
-        let zero = vdupq_n_u8(0);
-        let max = vdupq_n_u16(255);
-        let mut left = vld1q_dup_u8(row.as_ptr().add(x - 1));
-        while x + 16 <= n {
-            let top = vld1q_u8(prev.as_ptr().add(x));
-            let top_left = vld1q_u8(prev.as_ptr().add(x - 1));
-            let mut s = vaddq_u8(vld1q_u8(row.as_ptr().add(x)), vsubq_u8(top, top_left));
-            s = vaddq_u8(s, vextq_u8::<15>(zero, s));
-            s = vaddq_u8(s, vextq_u8::<14>(zero, s));
-            s = vaddq_u8(s, vextq_u8::<12>(zero, s));
-            s = vaddq_u8(s, vextq_u8::<8>(zero, s));
-            let out = vaddq_u8(s, left);
-            // The unclamped predictions, from the left pixels this block would produce.
-            let before = vextq_u8::<15>(left, out);
-            let pred = |b: uint8x8_t, t: uint8x8_t, tl: uint8x8_t| vsubw_u8(vaddl_u8(b, t), tl);
-            let lo = pred(vget_low_u8(before), vget_low_u8(top), vget_low_u8(top_left));
-            let hi = pred(
-                vget_high_u8(before),
-                vget_high_u8(top),
-                vget_high_u8(top_left),
-            );
-            if vmaxvq_u16(vorrq_u16(vcgtq_u16(lo, max), vcgtq_u16(hi, max))) != 0 {
-                break;
-            }
-            vst1q_u8(row.as_mut_ptr().add(x), out);
-            left = vdupq_laneq_u8::<15>(out);
-            x += 16;
+    let (done, row) = row.split_at_mut(x);
+    let top_left = prev.get(x - 1..).unwrap_or_default();
+    let top = top_left.get(1..).unwrap_or_default();
+    let zero = vdupq_n_u8(0);
+    let max = vdupq_n_u16(255);
+    let mut left = vdupq_n_u8(done[x - 1]);
+    let (row, top, top_left) = (
+        row.as_chunks_mut::<16>().0,
+        top.as_chunks::<16>().0,
+        top_left.as_chunks::<16>().0,
+    );
+    for (r, (top, top_left)) in row.iter_mut().zip(top.iter().zip(top_left)) {
+        let (top, top_left): (uint8x16_t, uint8x16_t) = (load(top), load(top_left));
+        let mut s = vaddq_u8(load(r), vsubq_u8(top, top_left));
+        s = vaddq_u8(s, vextq_u8::<15>(zero, s));
+        s = vaddq_u8(s, vextq_u8::<14>(zero, s));
+        s = vaddq_u8(s, vextq_u8::<12>(zero, s));
+        s = vaddq_u8(s, vextq_u8::<8>(zero, s));
+        let out = vaddq_u8(s, left);
+        // The unclamped predictions, from the left pixels this block would produce.
+        let before = vextq_u8::<15>(left, out);
+        let pred = |b: uint8x8_t, t: uint8x8_t, tl: uint8x8_t| vsubw_u8(vaddl_u8(b, t), tl);
+        let lo = pred(vget_low_u8(before), vget_low_u8(top), vget_low_u8(top_left));
+        let hi = pred(
+            vget_high_u8(before),
+            vget_high_u8(top),
+            vget_high_u8(top_left),
+        );
+        if vmaxvq_u16(vorrq_u16(vcgtq_u16(lo, max), vcgtq_u16(hi, max))) != 0 {
+            break;
         }
+        store(r, out);
+        left = vdupq_laneq_u8::<15>(out);
+        x += 16;
     }
     x
 }
 
 /// The horizontal alpha unfiltering of `row[x..]` (`row[x - 1]` done), a running sum 16
 /// pixels at a time. Returns where it stopped, with fewer than 16 pixels left.
-pub(crate) fn unfilter_horizontal(row: &mut [u8], mut x: usize) -> usize {
+#[allow(unsafe_code)]
+#[inline(always)]
+pub(crate) fn unfilter_horizontal(row: &mut [u8], x: usize) -> usize {
+    // SAFETY: NEON is part of aarch64.
+    unsafe { unfilter_horizontal_neon(row, x) }
+}
+
+#[target_feature(enable = "neon")]
+#[inline]
+fn unfilter_horizontal_neon(row: &mut [u8], mut x: usize) -> usize {
     assert!(x >= 1);
-    // SAFETY: the loads read row[x - 1..x + 16] and the store writes row[x..x + 16], in bounds
-    // for x + 16 <= row.len().
-    unsafe {
-        let zero = vdupq_n_u8(0);
-        let mut left = vld1q_dup_u8(row.as_ptr().add(x - 1));
-        while x + 16 <= row.len() {
-            let mut s = vld1q_u8(row.as_ptr().add(x));
-            s = vaddq_u8(s, vextq_u8::<15>(zero, s));
-            s = vaddq_u8(s, vextq_u8::<14>(zero, s));
-            s = vaddq_u8(s, vextq_u8::<12>(zero, s));
-            s = vaddq_u8(s, vextq_u8::<8>(zero, s));
-            let out = vaddq_u8(s, left);
-            vst1q_u8(row.as_mut_ptr().add(x), out);
-            left = vdupq_laneq_u8::<15>(out);
-            x += 16;
-        }
+    let (done, row) = row.split_at_mut(x);
+    let zero = vdupq_n_u8(0);
+    let mut left = vdupq_n_u8(done[x - 1]);
+    for r in row.as_chunks_mut::<16>().0 {
+        let mut s: uint8x16_t = load(r);
+        s = vaddq_u8(s, vextq_u8::<15>(zero, s));
+        s = vaddq_u8(s, vextq_u8::<14>(zero, s));
+        s = vaddq_u8(s, vextq_u8::<12>(zero, s));
+        s = vaddq_u8(s, vextq_u8::<8>(zero, s));
+        let out = vaddq_u8(s, left);
+        store(r, out);
+        left = vdupq_laneq_u8::<15>(out);
+        x += 16;
     }
     x
 }
