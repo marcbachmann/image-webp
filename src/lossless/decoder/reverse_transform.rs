@@ -75,6 +75,29 @@ pub(crate) fn apply_predictor_transform(
     }
 }
 
+/// The groups of `W` bytes of `out`, each with the `W` bytes from its top-left, top and top-right
+/// pixels on in `top`, which starts at the top-left of the first. Every view is as long as
+/// `out`, so the loops over them are unchecked.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[inline(always)]
+pub(super) fn with_top<'a, const W: usize>(
+    out: &'a mut [u8],
+    top: &'a [u8],
+) -> impl Iterator<Item = (&'a mut [u8; W], [&'a [u8; W]; 3])> + 'a {
+    let m = out.len();
+    let top = &top[..m + 8];
+    let tl = top[..m].as_chunks::<W>().0;
+    let t = top[4..m + 4].as_chunks::<W>().0;
+    let tr = top[8..].as_chunks::<W>().0;
+    out.as_chunks_mut::<W>()
+        .0
+        .iter_mut()
+        .zip(tl)
+        .zip(t)
+        .zip(tr)
+        .map(|(((o, tl), t), tr)| (o, [tl, t, tr]))
+}
+
 /// Undoes predictor `mode` over `image_data[range]` as [`apply_predictor_transform`] does per run of blocks.
 #[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
 fn predict_portable(mode: u8, image_data: &mut [u8], range: Range<usize>, width: usize) {

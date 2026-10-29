@@ -408,21 +408,48 @@ fn shrink_span<const N: usize>(
 }
 
 #[cfg(target_arch = "x86_64")]
-#[allow(unsafe_code)]
 mod sse2 {
     use core::arch::x86_64::*;
 
-    #[inline(always)]
-    unsafe fn emit(out: &mut [u32], sum: &mut Option<&mut [u32]>, i: usize, v: __m128i) {
-        _mm_storeu_si128(out.as_mut_ptr().add(i).cast(), v);
-        if let Some(sum) = sum {
-            let p = sum.as_mut_ptr().add(i).cast();
-            _mm_storeu_si128(p, _mm_add_epi32(_mm_loadu_si128(p), v));
+    use crate::simd_mem::{load, load_at, store};
+
+    /// Stores the `V` vectors `f` makes of each item of `src` to the next `4 * V` outputs of
+    /// `out`, adding them into `sum` as well where given; returns how many outputs it wrote.
+    /// `src` and `sum` cover the whole groups of `out`.
+    #[target_feature(enable = "sse2")]
+    #[inline]
+    fn each_group<X, const V: usize>(
+        src: impl Iterator<Item = X>,
+        out: &mut [u32],
+        sum: Option<&mut [u32]>,
+        f: impl Fn(X) -> [__m128i; V],
+    ) -> usize {
+        let out = out.as_chunks_mut::<4>().0.as_chunks_mut::<V>().0;
+        match sum {
+            Some(sum) => {
+                let sum = sum.as_chunks_mut::<4>().0.as_chunks_mut::<V>().0;
+                for ((o, s), x) in out.iter_mut().zip(sum).zip(src) {
+                    for ((o, s), v) in o.iter_mut().zip(s).zip(f(x)) {
+                        store(o, v);
+                        let v = _mm_add_epi32(load(&*s), v);
+                        store(s, v);
+                    }
+                }
+            }
+            None => {
+                for (o, x) in out.iter_mut().zip(src) {
+                    for (o, v) in o.iter_mut().zip(f(x)) {
+                        store(o, v);
+                    }
+                }
+            }
         }
+        out.len() * 4 * V
     }
 
     /// [`super::shrink_whole`] for the outputs whole vectors cover; returns how many it wrote.
     /// The products go through `madd`, so `x_sub` must fit an i16.
+    #[allow(unsafe_code)]
     pub(super) fn shrink_whole(
         src: &[u8],
         channels: usize,
@@ -436,121 +463,87 @@ mod sse2 {
         if x_sub > i16::MAX as u32 {
             return 0;
         }
-        let s = src.as_ptr();
         let mut i = 0;
         if crate::wide::has_avx2() && channels == 1 {
-            // SAFETY: the CPU has AVX2, and the bounds are checked above.
+            // SAFETY: the CPU supports AVX2.
             i = unsafe { super::avx2::shrink_whole(src, k, x_sub, out, sum.as_deref_mut()) };
         }
-        // SAFETY: each load ends within the `k` source samples of the outputs it writes, each
-        // store within the `n` outputs.
-        unsafe {
-            let z = _mm_setzero_si128();
-            let xs = _mm_set1_epi32(x_sub as i32);
-            match (channels, k) {
-                (1, 1) => {
-                    while i + 16 <= n {
-                        let v = _mm_loadu_si128(s.add(i).cast());
-                        let (lo, hi) = (_mm_unpacklo_epi8(v, z), _mm_unpackhi_epi8(v, z));
-                        emit(
-                            out,
-                            &mut sum,
-                            i,
-                            _mm_madd_epi16(_mm_unpacklo_epi16(lo, z), xs),
-                        );
-                        emit(
-                            out,
-                            &mut sum,
-                            i + 4,
-                            _mm_madd_epi16(_mm_unpackhi_epi16(lo, z), xs),
-                        );
-                        emit(
-                            out,
-                            &mut sum,
-                            i + 8,
-                            _mm_madd_epi16(_mm_unpacklo_epi16(hi, z), xs),
-                        );
-                        emit(
-                            out,
-                            &mut sum,
-                            i + 12,
-                            _mm_madd_epi16(_mm_unpackhi_epi16(hi, z), xs),
-                        );
-                        i += 16;
-                    }
-                }
-                (1, 2) => {
-                    let xs = _mm_set1_epi16(x_sub as i16);
-                    while i + 8 <= n {
-                        let v = _mm_loadu_si128(s.add(2 * i).cast());
-                        emit(
-                            out,
-                            &mut sum,
-                            i,
-                            _mm_madd_epi16(_mm_unpacklo_epi8(v, z), xs),
-                        );
-                        emit(
-                            out,
-                            &mut sum,
-                            i + 4,
-                            _mm_madd_epi16(_mm_unpackhi_epi8(v, z), xs),
-                        );
-                        i += 8;
-                    }
-                }
-                (1, 4) => {
-                    let (xs, low) = (_mm_set1_epi16(x_sub as i16), _mm_set1_epi16(0xff));
-                    while i + 4 <= n {
-                        let v = _mm_loadu_si128(s.add(4 * i).cast());
-                        let pairs = _mm_add_epi16(_mm_and_si128(v, low), _mm_srli_epi16::<8>(v));
-                        emit(out, &mut sum, i, _mm_madd_epi16(pairs, xs));
-                        i += 4;
-                    }
-                }
-                (1, 8) => {
-                    while i + 4 <= n {
-                        let a = _mm_sad_epu8(_mm_loadu_si128(s.add(8 * i).cast()), z);
-                        let b = _mm_sad_epu8(_mm_loadu_si128(s.add(8 * i + 16).cast()), z);
-                        let v = _mm_unpacklo_epi64(
-                            _mm_shuffle_epi32::<0b1000>(a),
-                            _mm_shuffle_epi32::<0b1000>(b),
-                        );
-                        emit(out, &mut sum, i, _mm_madd_epi16(v, xs));
-                        i += 4;
-                    }
-                }
-                (4, 2..=128) => {
-                    while i + 4 <= n {
-                        let p = s.add(i * k);
-                        let mut acc = z;
-                        for j in (0..k - 1).step_by(2) {
-                            let v = _mm_unpacklo_epi8(_mm_loadl_epi64(p.add(4 * j).cast()), z);
-                            acc = _mm_add_epi16(acc, _mm_add_epi16(v, _mm_srli_si128::<8>(v)));
-                        }
-                        if k % 2 == 1 {
-                            let v = _mm_cvtsi32_si128(
-                                p.add(4 * (k - 1)).cast::<i32>().read_unaligned(),
-                            );
-                            acc = _mm_add_epi16(acc, _mm_unpacklo_epi8(v, z));
-                        }
-                        emit(
-                            out,
-                            &mut sum,
-                            i,
-                            _mm_madd_epi16(_mm_unpacklo_epi16(acc, z), xs),
-                        );
-                        i += 4;
-                    }
-                }
-                _ => {}
+        let (src, out, sum) = (&src[i * k..], &mut out[i..], sum.map(|s| &mut s[i..n]));
+        // SAFETY: SSE2 is part of x86_64.
+        i + unsafe { shrink_whole_sse2(src, channels, k, x_sub, out, sum) }
+    }
+
+    #[target_feature(enable = "sse2")]
+    #[inline]
+    fn shrink_whole_sse2(
+        src: &[u8],
+        channels: usize,
+        k: usize,
+        x_sub: u32,
+        out: &mut [u32],
+        sum: Option<&mut [u32]>,
+    ) -> usize {
+        let z = _mm_setzero_si128();
+        let xs = _mm_set1_epi32(x_sub as i32);
+        match (channels, k) {
+            (1, 1) => each_group(src.as_chunks::<16>().0.iter(), out, sum, |v| {
+                let v = load(v);
+                let (lo, hi) = (_mm_unpacklo_epi8(v, z), _mm_unpackhi_epi8(v, z));
+                [
+                    _mm_madd_epi16(_mm_unpacklo_epi16(lo, z), xs),
+                    _mm_madd_epi16(_mm_unpackhi_epi16(lo, z), xs),
+                    _mm_madd_epi16(_mm_unpacklo_epi16(hi, z), xs),
+                    _mm_madd_epi16(_mm_unpackhi_epi16(hi, z), xs),
+                ]
+            }),
+            (1, 2) => {
+                let xs = _mm_set1_epi16(x_sub as i16);
+                each_group(src.as_chunks::<16>().0.iter(), out, sum, |v| {
+                    let v = load(v);
+                    [
+                        _mm_madd_epi16(_mm_unpacklo_epi8(v, z), xs),
+                        _mm_madd_epi16(_mm_unpackhi_epi8(v, z), xs),
+                    ]
+                })
             }
+            (1, 4) => {
+                let (xs, low) = (_mm_set1_epi16(x_sub as i16), _mm_set1_epi16(0xff));
+                each_group(src.as_chunks::<16>().0.iter(), out, sum, |v| {
+                    let v = load(v);
+                    let pairs = _mm_add_epi16(_mm_and_si128(v, low), _mm_srli_epi16::<8>(v));
+                    [_mm_madd_epi16(pairs, xs)]
+                })
+            }
+            (1, 8) => each_group(src.as_chunks::<32>().0.iter(), out, sum, |p| {
+                let a = _mm_sad_epu8(load(p), z);
+                let b = _mm_sad_epu8(load(&p[16..]), z);
+                let v = _mm_unpacklo_epi64(
+                    _mm_shuffle_epi32::<0b1000>(a),
+                    _mm_shuffle_epi32::<0b1000>(b),
+                );
+                [_mm_madd_epi16(v, xs)]
+            }),
+            (4, 2..=128) => each_group(src.chunks_exact(4 * k), out, sum, |p| {
+                let (pairs, last) = p.as_chunks::<8>();
+                let mut acc = z;
+                for v in pairs {
+                    let v = _mm_unpacklo_epi8(_mm_cvtsi64_si128(load(v)), z);
+                    acc = _mm_add_epi16(acc, _mm_add_epi16(v, _mm_srli_si128::<8>(v)));
+                }
+                if let Some(last) = last.first_chunk::<4>() {
+                    let v = _mm_cvtsi32_si128(load(last));
+                    acc = _mm_add_epi16(acc, _mm_unpacklo_epi8(v, z));
+                }
+                [_mm_madd_epi16(_mm_unpacklo_epi16(acc, z), xs)]
+            }),
+            _ => 0,
         }
-        i
     }
 
     /// [`super::shrink_span`] for every output pixel of one channel, four outputs to a vector where
     /// four in a row take `k` source pixels each. False for more channels.
     #[allow(clippy::too_many_arguments)]
+    #[allow(unsafe_code)]
     pub(super) fn shrink_spans(
         src: &[u8],
         channels: usize,
@@ -567,22 +560,38 @@ mod sse2 {
             return false;
         }
         if crate::wide::has_avx2() {
-            // SAFETY: the CPU has AVX2, and the bounds are checked above.
+            // SAFETY: the CPU supports AVX2.
             unsafe { super::avx2::shrink_spans(src, starts, weights, k, x_sub, fx_scale, out) };
             return true;
         }
+        // SAFETY: SSE2 is part of x86_64.
+        unsafe { shrink_spans_sse2(src, starts, weights, k, x_sub, fx_scale, out) };
+        true
+    }
+
+    #[target_feature(enable = "sse2")]
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn shrink_spans_sse2(
+        src: &[u8],
+        starts: &[u32],
+        weights: &[u32],
+        k: usize,
+        x_sub: u32,
+        fx_scale: u32,
+        out: &mut [u32],
+    ) {
+        let n = weights.len();
         let mut x = 0;
         while x < n {
             if whole_run(src, starts, k, x, 4) {
-                // SAFETY: `whole_run` checked the source pixels, and the outputs are within `n`.
-                unsafe { span4(src, starts, weights, k, x_sub, fx_scale, x, out) };
+                span4(src, starts, weights, k, x_sub, fx_scale, x, out);
                 x += 4;
             } else {
                 super::shrink_span::<1>(src, starts, weights, x_sub, fx_scale, x, out);
                 x += 1;
             }
         }
-        true
     }
 
     /// Whether outputs `x..x + m`, not the first, each take `k` source pixels within `src`.
@@ -598,11 +607,11 @@ mod sse2 {
             && a + m * k <= src.len()
     }
 
-    /// Outputs `x..x + 4` of `shrink_spans`, for which [`whole_run`] holds. Requires `weights`
-    /// and `out` of `starts.len() - 1` outputs.
-    #[inline(always)]
+    /// Outputs `x..x + 4` of `shrink_spans`, for which [`whole_run`] holds.
+    #[target_feature(enable = "sse2")]
+    #[inline]
     #[allow(clippy::too_many_arguments)]
-    pub(super) unsafe fn span4(
+    pub(super) fn span4(
         src: &[u8],
         starts: &[u32],
         weights: &[u32],
@@ -619,20 +628,19 @@ mod sse2 {
             _mm_set1_epi64x(1 << 31),
         );
         let a = starts[x] as usize;
-        let s = src.as_ptr();
-        let p = s.add(a);
-        let px = |i: usize| _mm_cvtsi32_si128(s.add(i).cast::<i32>().read_unaligned());
+        // The source pixel before the outputs' on, and the weight of the output before them on.
+        let (p, wp) = (&src[a - 1..a + 4 * k], &weights[x - 1..x + 4]);
         let (sums, last) = match k {
             1 => {
-                let v = _mm_unpacklo_epi16(_mm_unpacklo_epi8(px(a), z), z);
+                let v = _mm_unpacklo_epi16(_mm_unpacklo_epi8(_mm_cvtsi32_si128(load_at(p, 1)), z), z);
                 (v, v)
             }
             2 => {
-                let v = _mm_unpacklo_epi8(_mm_loadl_epi64(p.cast()), z);
+                let v = _mm_unpacklo_epi8(_mm_cvtsi64_si128(load_at(p, 1)), z);
                 (_mm_madd_epi16(v, ones), _mm_srli_epi32::<16>(v))
             }
             4 => {
-                let v = _mm_loadu_si128(p.cast());
+                let v = load_at(p, 1);
                 let pairs = _mm_add_epi16(
                     _mm_and_si128(v, _mm_set1_epi16(0xff)),
                     _mm_srli_epi16::<8>(v),
@@ -640,7 +648,7 @@ mod sse2 {
                 (_mm_madd_epi16(pairs, ones), _mm_srli_epi32::<24>(v))
             }
             _ => {
-                let (u, v) = (_mm_loadu_si128(p.cast()), _mm_loadu_si128(p.add(16).cast()));
+                let (u, v) = (load_at(p, 1), load_at(p, 17));
                 let (su, sv) = (_mm_sad_epu8(u, z), _mm_sad_epu8(v, z));
                 let (lu, lv) = (_mm_srli_epi64::<56>(u), _mm_srli_epi64::<56>(v));
                 let pick = |a, b| {
@@ -652,29 +660,26 @@ mod sse2 {
                 (pick(su, sv), pick(lu, lv))
             }
         };
-        let prev = _mm_or_si128(
-            _mm_slli_si128::<4>(last),
-            _mm_cvtsi32_si128(i32::from(*p.sub(1))),
-        );
-        let w = _mm_loadu_si128(weights.as_ptr().add(x).cast());
-        let wp = _mm_loadu_si128(weights.as_ptr().add(x - 1).cast());
-        let carry = mult_fix(_mm_madd_epi16(prev, wp), fx, round);
+        let prev = _mm_or_si128(_mm_slli_si128::<4>(last), _mm_cvtsi32_si128(i32::from(p[0])));
+        let carry = mult_fix(_mm_madd_epi16(prev, load(wp)), fx, round);
         let v = _mm_sub_epi32(
             _mm_madd_epi16(_mm_add_epi32(sums, carry), xs),
-            _mm_madd_epi16(last, w),
+            _mm_madd_epi16(last, load(&wp[1..])),
         );
-        _mm_storeu_si128(out.as_mut_ptr().add(x).cast(), v);
+        store(&mut out[x..x + 4], v);
     }
 
-    #[inline(always)]
-    unsafe fn mult_fix(v: __m128i, scale: __m128i, round: __m128i) -> __m128i {
+    #[target_feature(enable = "sse2")]
+    #[inline]
+    fn mult_fix(v: __m128i, scale: __m128i, round: __m128i) -> __m128i {
         let even = _mm_srli_epi64::<32>(_mm_add_epi64(_mm_mul_epu32(v, scale), round));
         let odd = _mm_add_epi64(_mm_mul_epu32(_mm_srli_epi64::<32>(v), scale), round);
         _mm_or_si128(even, _mm_and_si128(odd, _mm_set1_epi64x(-1 << 32)))
     }
 
-    #[inline(always)]
-    unsafe fn clip(v: __m128i) -> __m128i {
+    #[target_feature(enable = "sse2")]
+    #[inline]
+    fn clip(v: __m128i) -> __m128i {
         let small = _mm_cmpeq_epi32(_mm_srli_epi32::<8>(v), _mm_setzero_si128());
         _mm_or_si128(
             _mm_and_si128(v, small),
@@ -683,6 +688,7 @@ mod sse2 {
     }
 
     /// The shrinking export for the samples whole vectors cover; returns how many it wrote.
+    #[allow(unsafe_code)]
     pub(super) fn export_shrink(
         dst: &mut [u8],
         irow: &mut [u32],
@@ -690,146 +696,147 @@ mod sse2 {
         yscale: u32,
         fxy_scale: u32,
     ) -> usize {
-        let n = dst.len();
-        assert!(irow.len() >= n && frow.len() >= n);
         let mut i = 0;
         if crate::wide::has_avx2() {
-            // SAFETY: the CPU has AVX2.
+            // SAFETY: the CPU supports AVX2.
             i = unsafe { super::avx2::export_shrink(dst, irow, frow, yscale, fxy_scale) };
         }
-        export_shrink_from(dst, irow, frow, yscale, fxy_scale, i)
+        // SAFETY: SSE2 is part of x86_64.
+        unsafe { export_shrink_from(dst, irow, frow, yscale, fxy_scale, i) }
     }
 
     /// `export_shrink` with the samples before `i` already written.
+    #[target_feature(enable = "sse2")]
+    #[inline]
     pub(super) fn export_shrink_from(
         dst: &mut [u8],
         irow: &mut [u32],
         frow: &[u32],
         yscale: u32,
         fxy_scale: u32,
-        mut i: usize,
+        i: usize,
     ) -> usize {
         let n = dst.len();
-        assert!(irow.len() >= n && frow.len() >= n);
-        // SAFETY: every load and store ends within the first `n` samples of the rows.
-        unsafe {
-            let (round, floor) = (_mm_set1_epi64x(1 << 31), _mm_setzero_si128());
-            let (ys, fxy) = (
-                _mm_set1_epi64x(i64::from(yscale)),
-                _mm_set1_epi64x(i64::from(fxy_scale)),
-            );
-            while i + 16 <= n {
-                let mut d = [_mm_setzero_si128(); 4];
-                for (g, d) in d.iter_mut().enumerate() {
-                    let ip = irow.as_mut_ptr().add(i + 4 * g).cast::<__m128i>();
-                    let v = _mm_loadu_si128(ip);
-                    let frac = match yscale {
-                        0 => floor,
-                        _ => mult_fix(
-                            _mm_loadu_si128(frow.as_ptr().add(i + 4 * g).cast()),
-                            ys,
-                            floor,
-                        ),
-                    };
-                    _mm_storeu_si128(ip, frac);
-                    *d = clip(mult_fix(_mm_sub_epi32(v, frac), fxy, round));
-                }
-                let bytes =
-                    _mm_packus_epi16(_mm_packs_epi32(d[0], d[1]), _mm_packs_epi32(d[2], d[3]));
-                _mm_storeu_si128(dst.as_mut_ptr().add(i).cast(), bytes);
-                i += 16;
+        let (round, floor) = (_mm_set1_epi64x(1 << 31), _mm_setzero_si128());
+        let (ys, fxy) = (
+            _mm_set1_epi64x(i64::from(yscale)),
+            _mm_set1_epi64x(i64::from(fxy_scale)),
+        );
+        let dst = dst[i..].as_chunks_mut::<16>().0;
+        let irow = irow[i..n].as_chunks_mut::<4>().0.as_chunks_mut::<4>().0;
+        let frow = frow[i..n].as_chunks::<4>().0.as_chunks::<4>().0;
+        for ((dst, irow), frow) in dst.iter_mut().zip(irow).zip(frow) {
+            let mut d = [floor; 4];
+            for ((d, ir), fr) in d.iter_mut().zip(irow).zip(frow) {
+                let v = load(&*ir);
+                let frac = match yscale {
+                    0 => floor,
+                    _ => mult_fix(load(fr), ys, floor),
+                };
+                store(ir, frac);
+                *d = clip(mult_fix(_mm_sub_epi32(v, frac), fxy, round));
             }
+            let bytes = _mm_packus_epi16(_mm_packs_epi32(d[0], d[1]), _mm_packs_epi32(d[2], d[3]));
+            store(dst, bytes);
         }
-        i
+        i + dst.len() * 16
     }
 }
 
 /// The SSE2 kernels of `mod sse2` 256 bits wide.
 #[cfg(target_arch = "x86_64")]
-#[allow(unsafe_code)]
 mod avx2 {
     use super::sse2;
     use core::arch::x86_64::*;
 
-    #[inline(always)]
-    unsafe fn mult_fix(v: __m256i, scale: __m256i, round: __m256i) -> __m256i {
+    use crate::simd_mem::{load, load_at, store};
+
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn mult_fix(v: __m256i, scale: __m256i, round: __m256i) -> __m256i {
         let even = _mm256_srli_epi64::<32>(_mm256_add_epi64(_mm256_mul_epu32(v, scale), round));
         let odd = _mm256_add_epi64(_mm256_mul_epu32(_mm256_srli_epi64::<32>(v), scale), round);
         _mm256_blend_epi32::<0b1010_1010>(even, odd)
     }
 
-    #[inline(always)]
-    unsafe fn clip(v: __m256i) -> __m256i {
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn clip(v: __m256i) -> __m256i {
         _mm256_min_epu32(v, _mm256_set1_epi32(255))
     }
 
-    #[inline(always)]
-    unsafe fn emit(out: &mut [u32], sum: &mut Option<&mut [u32]>, i: usize, v: __m256i) {
-        _mm256_storeu_si256(out.as_mut_ptr().add(i).cast(), v);
-        if let Some(sum) = sum {
-            let p = sum.as_mut_ptr().add(i).cast();
-            _mm256_storeu_si256(p, _mm256_add_epi32(_mm256_loadu_si256(p), v));
+    /// `sse2::each_group` with vectors of eight outputs.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn each_group<X, const V: usize>(
+        src: impl Iterator<Item = X>,
+        out: &mut [u32],
+        sum: Option<&mut [u32]>,
+        f: impl Fn(X) -> [__m256i; V],
+    ) -> usize {
+        let out = out.as_chunks_mut::<8>().0.as_chunks_mut::<V>().0;
+        match sum {
+            Some(sum) => {
+                let sum = sum.as_chunks_mut::<8>().0.as_chunks_mut::<V>().0;
+                for ((o, s), x) in out.iter_mut().zip(sum).zip(src) {
+                    for ((o, s), v) in o.iter_mut().zip(s).zip(f(x)) {
+                        store(o, v);
+                        let v = _mm256_add_epi32(load(&*s), v);
+                        store(s, v);
+                    }
+                }
+            }
+            None => {
+                for (o, x) in out.iter_mut().zip(src) {
+                    for (o, v) in o.iter_mut().zip(f(x)) {
+                        store(o, v);
+                    }
+                }
+            }
         }
+        out.len() * 8 * V
     }
 
     /// `sse2::shrink_whole` of one channel 8 or 32 outputs at a time; returns how many it
     /// wrote. Takes `src` of at least `k` samples an output and `x_sub` that fits an i16.
     #[target_feature(enable = "avx2")]
-    pub(super) unsafe fn shrink_whole(
+    pub(super) fn shrink_whole(
         src: &[u8],
         k: usize,
         x_sub: u32,
         out: &mut [u32],
-        mut sum: Option<&mut [u32]>,
+        sum: Option<&mut [u32]>,
     ) -> usize {
-        let n = out.len();
-        let s = src.as_ptr();
-        let mut i = 0;
         let z = _mm256_setzero_si256();
         let xs = _mm256_set1_epi32(x_sub as i32);
         let xs16 = _mm256_set1_epi16(x_sub as i16);
         match k {
-            1 => {
-                while i + 32 <= n {
-                    for g in 0..4 {
-                        let v = _mm256_cvtepu8_epi32(_mm_loadl_epi64(s.add(i + 8 * g).cast()));
-                        emit(out, &mut sum, i + 8 * g, _mm256_madd_epi16(v, xs));
-                    }
-                    i += 32;
-                }
-            }
-            2 => {
-                while i + 8 <= n {
-                    let v = _mm256_cvtepu8_epi16(_mm_loadu_si128(s.add(2 * i).cast()));
-                    emit(out, &mut sum, i, _mm256_madd_epi16(v, xs16));
-                    i += 8;
-                }
-            }
+            1 => each_group(src.as_chunks::<32>().0.iter(), out, sum, |p| {
+                let g = |at: usize| _mm256_cvtepu8_epi32(_mm_cvtsi64_si128(load_at(p, at)));
+                [g(0), g(8), g(16), g(24)].map(|v| _mm256_madd_epi16(v, xs))
+            }),
+            2 => each_group(src.as_chunks::<16>().0.iter(), out, sum, |p| {
+                [_mm256_madd_epi16(_mm256_cvtepu8_epi16(load(p)), xs16)]
+            }),
             4 => {
                 let low = _mm256_set1_epi16(0xff);
-                while i + 8 <= n {
-                    let v = _mm256_loadu_si256(s.add(4 * i).cast());
+                each_group(src.as_chunks::<32>().0.iter(), out, sum, |p| {
+                    let v = load(p);
                     let pairs = _mm256_add_epi16(_mm256_and_si256(v, low), _mm256_srli_epi16::<8>(v));
-                    emit(out, &mut sum, i, _mm256_madd_epi16(pairs, xs16));
-                    i += 8;
-                }
+                    [_mm256_madd_epi16(pairs, xs16)]
+                })
             }
-            8 => {
-                while i + 8 <= n {
-                    let a = _mm256_sad_epu8(_mm256_loadu_si256(s.add(8 * i).cast()), z);
-                    let b = _mm256_sad_epu8(_mm256_loadu_si256(s.add(8 * i + 32).cast()), z);
-                    let v = _mm256_unpacklo_epi64(
-                        _mm256_shuffle_epi32::<0b1000>(a),
-                        _mm256_shuffle_epi32::<0b1000>(b),
-                    );
-                    let v = _mm256_permute4x64_epi64::<0b1101_1000>(v);
-                    emit(out, &mut sum, i, _mm256_madd_epi16(v, xs));
-                    i += 8;
-                }
-            }
-            _ => {}
+            8 => each_group(src.as_chunks::<64>().0.iter(), out, sum, |p| {
+                let a = _mm256_sad_epu8(load(p), z);
+                let b = _mm256_sad_epu8(load(&p[32..]), z);
+                let v = _mm256_unpacklo_epi64(
+                    _mm256_shuffle_epi32::<0b1000>(a),
+                    _mm256_shuffle_epi32::<0b1000>(b),
+                );
+                [_mm256_madd_epi16(_mm256_permute4x64_epi64::<0b1101_1000>(v), xs)]
+            }),
+            _ => 0,
         }
-        i
     }
 
     /// `sse2::shrink_spans` of one channel, eight outputs to a vector where eight in a row take
@@ -837,7 +844,7 @@ mod avx2 {
     /// than `weights` and `out` of as many outputs.
     #[target_feature(enable = "avx2")]
     #[allow(clippy::too_many_arguments)]
-    pub(super) unsafe fn shrink_spans(
+    pub(super) fn shrink_spans(
         src: &[u8],
         starts: &[u32],
         weights: &[u32],
@@ -847,7 +854,6 @@ mod avx2 {
         out: &mut [u32],
     ) {
         let n = weights.len();
-        let s = src.as_ptr();
         let z = _mm256_setzero_si256();
         let (xs, ones) = (_mm256_set1_epi32(x_sub as i32), _mm256_set1_epi16(1));
         let (fx, round) = (
@@ -867,18 +873,20 @@ mod avx2 {
                 }
                 continue;
             }
-            let p = s.add(starts[x] as usize);
+            let a = starts[x] as usize;
+            // The source pixel before the outputs' on, and the weight of the output before them on.
+            let (p, wp) = (&src[a - 1..a + 8 * k], &weights[x - 1..x + 8]);
             let (sums, last) = match k {
                 1 => {
-                    let v = _mm256_cvtepu8_epi32(_mm_loadl_epi64(p.cast()));
+                    let v = _mm256_cvtepu8_epi32(_mm_cvtsi64_si128(load_at(p, 1)));
                     (v, v)
                 }
                 2 => {
-                    let v = _mm256_cvtepu8_epi16(_mm_loadu_si128(p.cast()));
+                    let v = _mm256_cvtepu8_epi16(load_at(p, 1));
                     (_mm256_madd_epi16(v, ones), _mm256_srli_epi32::<16>(v))
                 }
                 4 => {
-                    let v = _mm256_loadu_si256(p.cast());
+                    let v = load_at(p, 1);
                     let pairs = _mm256_add_epi16(
                         _mm256_and_si256(v, _mm256_set1_epi16(0xff)),
                         _mm256_srli_epi16::<8>(v),
@@ -886,7 +894,7 @@ mod avx2 {
                     (_mm256_madd_epi16(pairs, ones), _mm256_srli_epi32::<24>(v))
                 }
                 _ => {
-                    let (u, v) = (_mm256_loadu_si256(p.cast()), _mm256_loadu_si256(p.add(32).cast()));
+                    let (u, v) = (load_at(p, 1), load_at(p, 33));
                     let (su, sv) = (_mm256_sad_epu8(u, z), _mm256_sad_epu8(v, z));
                     let (lu, lv) = (_mm256_srli_epi64::<56>(u), _mm256_srli_epi64::<56>(v));
                     let pick = |a, b| {
@@ -900,23 +908,21 @@ mod avx2 {
             };
             let prev = _mm256_blend_epi32::<1>(
                 _mm256_permutevar8x32_epi32(last, back),
-                _mm256_set1_epi32(i32::from(*p.sub(1))),
+                _mm256_set1_epi32(i32::from(p[0])),
             );
-            let w = _mm256_loadu_si256(weights.as_ptr().add(x).cast());
-            let wp = _mm256_loadu_si256(weights.as_ptr().add(x - 1).cast());
-            let carry = mult_fix(_mm256_madd_epi16(prev, wp), fx, round);
+            let carry = mult_fix(_mm256_madd_epi16(prev, load(wp)), fx, round);
             let v = _mm256_sub_epi32(
                 _mm256_madd_epi16(_mm256_add_epi32(sums, carry), xs),
-                _mm256_madd_epi16(last, w),
+                _mm256_madd_epi16(last, load(&wp[1..])),
             );
-            _mm256_storeu_si256(out.as_mut_ptr().add(x).cast(), v);
+            store(&mut out[x..x + 8], v);
             x += 8;
         }
     }
 
     /// `sse2::export_shrink` 32 samples at a time; returns how many it wrote.
     #[target_feature(enable = "avx2")]
-    pub(super) unsafe fn export_shrink(
+    pub(super) fn export_shrink(
         dst: &mut [u8],
         irow: &mut [u32],
         frow: &[u32],
@@ -924,39 +930,33 @@ mod avx2 {
         fxy_scale: u32,
     ) -> usize {
         let n = dst.len();
-        assert!(irow.len() >= n && frow.len() >= n);
-        let mut i = 0;
         let (round, floor) = (_mm256_set1_epi64x(1 << 31), _mm256_setzero_si256());
         let (ys, fxy) = (
             _mm256_set1_epi64x(i64::from(yscale)),
             _mm256_set1_epi64x(i64::from(fxy_scale)),
         );
         let order = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
-        while i + 32 <= n {
+        let dst = dst.as_chunks_mut::<32>().0;
+        let irow = irow[..n].as_chunks_mut::<8>().0.as_chunks_mut::<4>().0;
+        let frow = frow[..n].as_chunks::<8>().0.as_chunks::<4>().0;
+        for ((dst, irow), frow) in dst.iter_mut().zip(irow).zip(frow) {
             let mut d = [floor; 4];
-            for (g, d) in d.iter_mut().enumerate() {
-                let ip = irow.as_mut_ptr().add(i + 8 * g).cast::<__m256i>();
-                let v = _mm256_loadu_si256(ip);
+            for ((d, ir), fr) in d.iter_mut().zip(irow).zip(frow) {
+                let v = load(&*ir);
                 let frac = match yscale {
                     0 => floor,
-                    _ => mult_fix(
-                        _mm256_loadu_si256(frow.as_ptr().add(i + 8 * g).cast()),
-                        ys,
-                        floor,
-                    ),
+                    _ => mult_fix(load(fr), ys, floor),
                 };
-                _mm256_storeu_si256(ip, frac);
+                store(ir, frac);
                 *d = clip(mult_fix(_mm256_sub_epi32(v, frac), fxy, round));
             }
             let bytes = _mm256_packus_epi16(
                 _mm256_packs_epi32(d[0], d[1]),
                 _mm256_packs_epi32(d[2], d[3]),
             );
-            let bytes = _mm256_permutevar8x32_epi32(bytes, order);
-            _mm256_storeu_si256(dst.as_mut_ptr().add(i).cast(), bytes);
-            i += 32;
+            store(dst, _mm256_permutevar8x32_epi32(bytes, order));
         }
-        i
+        dst.len() * 32
     }
 }
 
@@ -964,131 +964,156 @@ mod avx2 {
 /// whole groups of 8 cover: they multiply by half the scale with `vqrdmulh`, on the samples as
 /// signed, subtract saturating and narrow through 16 bits. The rest of a row takes the C ones.
 #[cfg(target_arch = "aarch64")]
-#[allow(unsafe_code)]
 mod neon {
     use core::arch::aarch64::*;
 
-    #[inline(always)]
-    unsafe fn mult_fix(v: uint32x4_t, half_scale: int32x4_t) -> uint32x4_t {
+    use crate::simd_mem::{load, load_at, store};
+
+    #[target_feature(enable = "neon")]
+    #[inline]
+    fn mult_fix(v: uint32x4_t, half_scale: int32x4_t) -> uint32x4_t {
         vreinterpretq_u32_s32(vqrdmulhq_s32(vreinterpretq_s32_u32(v), half_scale))
     }
 
-    #[inline(always)]
-    unsafe fn mult_fix_floor(v: uint32x4_t, half_scale: int32x4_t) -> uint32x4_t {
+    #[target_feature(enable = "neon")]
+    #[inline]
+    fn mult_fix_floor(v: uint32x4_t, half_scale: int32x4_t) -> uint32x4_t {
         vreinterpretq_u32_s32(vqdmulhq_s32(vreinterpretq_s32_u32(v), half_scale))
     }
 
-    #[inline(always)]
-    unsafe fn half(scale: u32) -> int32x4_t {
+    #[target_feature(enable = "neon")]
+    #[inline]
+    fn half(scale: u32) -> int32x4_t {
         vdupq_n_s32((scale >> 1) as i32)
     }
 
-    #[inline(always)]
-    unsafe fn narrow(a: uint32x4_t, b: uint32x4_t) -> uint8x8_t {
+    #[target_feature(enable = "neon")]
+    #[inline]
+    fn narrow(a: uint32x4_t, b: uint32x4_t) -> uint8x8_t {
         vqmovn_u16(vcombine_u16(vmovn_u32(a), vmovn_u32(b)))
     }
 
     /// [`super::mult_fix`], which libwebp's import keeps in C.
-    #[inline(always)]
-    unsafe fn mult_fix_c(v: uint32x4_t, scale: u32) -> uint32x4_t {
+    #[target_feature(enable = "neon")]
+    #[inline]
+    fn mult_fix_c(v: uint32x4_t, scale: u32) -> uint32x4_t {
         let lo = vrshrn_n_u64::<32>(vmull_n_u32(vget_low_u32(v), scale));
         let hi = vrshrn_n_u64::<32>(vmull_high_n_u32(v, scale));
         vcombine_u32(lo, hi)
     }
 
-    #[inline(always)]
-    unsafe fn load4(p: *const u8) -> uint8x8_t {
-        vreinterpret_u8_u32(vdup_n_u32(p.cast::<u32>().read_unaligned()))
+    #[target_feature(enable = "neon")]
+    #[inline]
+    fn load4(p: &[u8]) -> uint8x8_t {
+        vreinterpret_u8_u32(vdup_n_u32(load(p)))
     }
 
-    #[inline(always)]
-    unsafe fn emit(out: &mut [u32], sum: &mut Option<&mut [u32]>, i: usize, v: uint32x4_t) {
-        vst1q_u32(out.as_mut_ptr().add(i), v);
-        if let Some(sum) = sum {
-            let p = sum.as_mut_ptr().add(i);
-            vst1q_u32(p, vaddq_u32(vld1q_u32(p), v));
+    /// Stores the `V` vectors `f` makes of each item of `src` to the next `4 * V` outputs of
+    /// `out`, adding them into `sum` as well where given; returns how many outputs it wrote.
+    /// `src` and `sum` cover the whole groups of `out`.
+    #[target_feature(enable = "neon")]
+    #[inline]
+    fn each_group<X, const V: usize>(
+        src: impl Iterator<Item = X>,
+        out: &mut [u32],
+        sum: Option<&mut [u32]>,
+        f: impl Fn(X) -> [uint32x4_t; V],
+    ) -> usize {
+        let out = out.as_chunks_mut::<4>().0.as_chunks_mut::<V>().0;
+        match sum {
+            Some(sum) => {
+                let sum = sum.as_chunks_mut::<4>().0.as_chunks_mut::<V>().0;
+                for ((o, s), x) in out.iter_mut().zip(sum).zip(src) {
+                    for ((o, s), v) in o.iter_mut().zip(s).zip(f(x)) {
+                        store(o, v);
+                        let v = vaddq_u32(load(&*s), v);
+                        store(s, v);
+                    }
+                }
+            }
+            None => {
+                for (o, x) in out.iter_mut().zip(src) {
+                    for (o, v) in o.iter_mut().zip(f(x)) {
+                        store(o, v);
+                    }
+                }
+            }
         }
+        out.len() * 4 * V
     }
 
     /// [`super::shrink_whole`] for the outputs whole vectors cover; returns how many it wrote.
+    #[allow(unsafe_code)]
     pub(super) fn shrink_whole(
         src: &[u8],
         channels: usize,
         k: usize,
         x_sub: u32,
         out: &mut [u32],
-        mut sum: Option<&mut [u32]>,
+        sum: Option<&mut [u32]>,
     ) -> usize {
         let n = out.len();
         assert!(src.len() >= n * k && sum.as_ref().is_none_or(|s| s.len() >= n));
-        let s = src.as_ptr();
-        let mut i = 0;
-        // SAFETY: each load ends within the `k` source samples of the outputs it writes, each
-        // store within the `n` outputs.
-        unsafe {
-            let xs = vdupq_n_u32(x_sub);
-            let widen = |v: uint16x4_t| vmulq_u32(vmovl_u16(v), xs);
-            match (channels, k) {
-                (1, 1) => {
-                    while i + 16 <= n {
-                        let v = vld1q_u8(s.add(i));
-                        let (lo, hi) = (vmovl_u8(vget_low_u8(v)), vmovl_high_u8(v));
-                        emit(out, &mut sum, i, widen(vget_low_u16(lo)));
-                        emit(out, &mut sum, i + 4, widen(vget_high_u16(lo)));
-                        emit(out, &mut sum, i + 8, widen(vget_low_u16(hi)));
-                        emit(out, &mut sum, i + 12, widen(vget_high_u16(hi)));
-                        i += 16;
-                    }
+        // SAFETY: NEON is part of aarch64.
+        unsafe { shrink_whole_neon(src, channels, k, x_sub, out, sum) }
+    }
+
+    #[target_feature(enable = "neon")]
+    #[inline]
+    fn shrink_whole_neon(
+        src: &[u8],
+        channels: usize,
+        k: usize,
+        x_sub: u32,
+        out: &mut [u32],
+        sum: Option<&mut [u32]>,
+    ) -> usize {
+        let xs = vdupq_n_u32(x_sub);
+        let widen = |v: uint16x4_t| vmulq_u32(vmovl_u16(v), xs);
+        match (channels, k) {
+            (1, 1) => each_group(src.as_chunks::<16>().0.iter(), out, sum, |v| {
+                let v = load(v);
+                let (lo, hi) = (vmovl_u8(vget_low_u8(v)), vmovl_high_u8(v));
+                [
+                    widen(vget_low_u16(lo)),
+                    widen(vget_high_u16(lo)),
+                    widen(vget_low_u16(hi)),
+                    widen(vget_high_u16(hi)),
+                ]
+            }),
+            (1, 2) => each_group(src.as_chunks::<16>().0.iter(), out, sum, |v| {
+                let v = vpaddlq_u8(load(v));
+                [widen(vget_low_u16(v)), widen(vget_high_u16(v))]
+            }),
+            (1, 4) => each_group(src.as_chunks::<16>().0.iter(), out, sum, |v| {
+                [vmulq_u32(vpaddlq_u16(vpaddlq_u8(load(v))), xs)]
+            }),
+            (1, 8) => each_group(src.as_chunks::<32>().0.iter(), out, sum, |p| {
+                let a = vpaddlq_u16(vpaddlq_u8(load(p)));
+                let b = vpaddlq_u16(vpaddlq_u8(load(&p[16..])));
+                [vmulq_u32(vpaddq_u32(a, b), xs)]
+            }),
+            // Two pixels to a 16-bit vector: up to 256 pixels' channel sums fit.
+            (4, 2..=256) => each_group(src.chunks_exact(4 * k), out, sum, |p| {
+                let (pairs, last) = p.as_chunks::<8>();
+                let mut acc = vdupq_n_u16(0);
+                for v in pairs {
+                    acc = vaddw_u8(acc, load(v));
                 }
-                (1, 2) => {
-                    while i + 8 <= n {
-                        let v = vpaddlq_u8(vld1q_u8(s.add(2 * i)));
-                        emit(out, &mut sum, i, widen(vget_low_u16(v)));
-                        emit(out, &mut sum, i + 4, widen(vget_high_u16(v)));
-                        i += 8;
-                    }
+                let mut px = vadd_u16(vget_low_u16(acc), vget_high_u16(acc));
+                if let Some(last) = last.first_chunk::<4>() {
+                    px = vadd_u16(px, vget_low_u16(vmovl_u8(load4(last))));
                 }
-                (1, 4) => {
-                    while i + 4 <= n {
-                        let v = vpaddlq_u16(vpaddlq_u8(vld1q_u8(s.add(4 * i))));
-                        emit(out, &mut sum, i, vmulq_u32(v, xs));
-                        i += 4;
-                    }
-                }
-                (1, 8) => {
-                    while i + 4 <= n {
-                        let p = s.add(8 * i);
-                        let a = vpaddlq_u16(vpaddlq_u8(vld1q_u8(p)));
-                        let b = vpaddlq_u16(vpaddlq_u8(vld1q_u8(p.add(16))));
-                        emit(out, &mut sum, i, vmulq_u32(vpaddq_u32(a, b), xs));
-                        i += 4;
-                    }
-                }
-                // Two pixels to a 16-bit vector: up to 256 pixels' channel sums fit.
-                (4, 2..=256) => {
-                    while i + 4 <= n {
-                        let p = s.add(i * k);
-                        let mut acc = vdupq_n_u16(0);
-                        for j in (0..k - 1).step_by(2) {
-                            acc = vaddw_u8(acc, vld1_u8(p.add(4 * j)));
-                        }
-                        let mut px = vadd_u16(vget_low_u16(acc), vget_high_u16(acc));
-                        if k % 2 == 1 {
-                            px = vadd_u16(px, vget_low_u16(vmovl_u8(load4(p.add(4 * (k - 1))))));
-                        }
-                        emit(out, &mut sum, i, widen(px));
-                        i += 4;
-                    }
-                }
-                _ => {}
-            }
+                [widen(px)]
+            }),
+            _ => 0,
         }
-        i
     }
 
     /// [`super::shrink_span`] for every output pixel of one channel, four outputs to a vector where
     /// four in a row take `k` source pixels each. False for more channels.
     #[allow(clippy::too_many_arguments)]
+    #[allow(unsafe_code)]
     pub(super) fn shrink_spans(
         src: &[u8],
         channels: usize,
@@ -1104,59 +1129,71 @@ mod neon {
         if channels != 1 {
             return false;
         }
-        let s = src.as_ptr();
-        // SAFETY: each load is checked against `src` through `starts` before it is made, each
-        // store ends within the first `n` outputs.
-        unsafe {
-            let xs = vdupq_n_u32(x_sub);
-            let mut x = 0;
-            while x < n {
-                let a = starts[x] as usize;
-                let whole = x >= 1 && x + 4 <= n && a >= 1 && starts[x + 4] as usize == a + 4 * k;
-                if !(whole && matches!(k, 1 | 2 | 4 | 8) && a + 4 * k <= src.len()) {
-                    super::shrink_span::<1>(src, starts, weights, x_sub, fx_scale, x, out);
-                    x += 1;
-                    continue;
-                }
-                let p = s.add(a);
-                let (sums, last) = match k {
-                    1 => {
-                        let v = vmovl_u16(vget_low_u16(vmovl_u8(load4(p))));
-                        (v, v)
-                    }
-                    2 => {
-                        let v = vld1_u8(p);
-                        let last = vshr_n_u16::<8>(vreinterpret_u16_u8(v));
-                        (vmovl_u16(vpaddl_u8(v)), vmovl_u16(last))
-                    }
-                    4 => {
-                        let v = vld1q_u8(p);
-                        let last = vshrq_n_u32::<24>(vreinterpretq_u32_u8(v));
-                        (vpaddlq_u16(vpaddlq_u8(v)), last)
-                    }
-                    _ => {
-                        let (u, v) = (vld1q_u8(p), vld1q_u8(p.add(16)));
-                        let sums =
-                            vpaddq_u32(vpaddlq_u16(vpaddlq_u8(u)), vpaddlq_u16(vpaddlq_u8(v)));
-                        let lu = vmovn_u64(vshrq_n_u64::<56>(vreinterpretq_u64_u8(u)));
-                        let lv = vmovn_u64(vshrq_n_u64::<56>(vreinterpretq_u64_u8(v)));
-                        (sums, vcombine_u32(lu, lv))
-                    }
-                };
-                let prev = vextq_u32::<3>(vdupq_n_u32(u32::from(*p.sub(1))), last);
-                let w = vld1q_u32(weights.as_ptr().add(x));
-                let wp = vld1q_u32(weights.as_ptr().add(x - 1));
-                let carry = mult_fix_c(vmulq_u32(prev, wp), fx_scale);
-                let v = vsubq_u32(vmulq_u32(vaddq_u32(sums, carry), xs), vmulq_u32(last, w));
-                vst1q_u32(out.as_mut_ptr().add(x), v);
-                x += 4;
-            }
-        }
+        // SAFETY: NEON is part of aarch64.
+        unsafe { shrink_spans_neon(src, starts, weights, k, x_sub, fx_scale, out) };
         true
+    }
+
+    #[target_feature(enable = "neon")]
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn shrink_spans_neon(
+        src: &[u8],
+        starts: &[u32],
+        weights: &[u32],
+        k: usize,
+        x_sub: u32,
+        fx_scale: u32,
+        out: &mut [u32],
+    ) {
+        let n = weights.len();
+        let xs = vdupq_n_u32(x_sub);
+        let mut x = 0;
+        while x < n {
+            let a = starts[x] as usize;
+            let whole = x >= 1 && x + 4 <= n && a >= 1 && starts[x + 4] as usize == a + 4 * k;
+            if !(whole && matches!(k, 1 | 2 | 4 | 8) && a + 4 * k <= src.len()) {
+                super::shrink_span::<1>(src, starts, weights, x_sub, fx_scale, x, out);
+                x += 1;
+                continue;
+            }
+            // The source pixel before the outputs' on, and the weight of the output before them on.
+            let (p, wp) = (&src[a - 1..a + 4 * k], &weights[x - 1..x + 4]);
+            let (sums, last) = match k {
+                1 => {
+                    let v = vmovl_u16(vget_low_u16(vmovl_u8(load4(&p[1..]))));
+                    (v, v)
+                }
+                2 => {
+                    let v: uint8x8_t = load_at(p, 1);
+                    let last = vshr_n_u16::<8>(vreinterpret_u16_u8(v));
+                    (vmovl_u16(vpaddl_u8(v)), vmovl_u16(last))
+                }
+                4 => {
+                    let v: uint8x16_t = load_at(p, 1);
+                    let last = vshrq_n_u32::<24>(vreinterpretq_u32_u8(v));
+                    (vpaddlq_u16(vpaddlq_u8(v)), last)
+                }
+                _ => {
+                    let (u, v): (uint8x16_t, uint8x16_t) = (load_at(p, 1), load_at(p, 17));
+                    let sums =
+                        vpaddq_u32(vpaddlq_u16(vpaddlq_u8(u)), vpaddlq_u16(vpaddlq_u8(v)));
+                    let lu = vmovn_u64(vshrq_n_u64::<56>(vreinterpretq_u64_u8(u)));
+                    let lv = vmovn_u64(vshrq_n_u64::<56>(vreinterpretq_u64_u8(v)));
+                    (sums, vcombine_u32(lu, lv))
+                }
+            };
+            let prev = vextq_u32::<3>(vdupq_n_u32(u32::from(p[0])), last);
+            let carry = mult_fix_c(vmulq_u32(prev, load(wp)), fx_scale);
+            let v = vsubq_u32(vmulq_u32(vaddq_u32(sums, carry), xs), vmulq_u32(last, load(&wp[1..])));
+            store(&mut out[x..x + 4], v);
+            x += 4;
+        }
     }
 
     /// `RescalerExportRowExpand_NEON`, interpolating `frow` and `irow` by `ab` where given;
     /// returns how many samples it wrote.
+    #[allow(unsafe_code)]
     pub(super) fn export_expand(
         dst: &mut [u8],
         frow: &[u32],
@@ -1164,28 +1201,40 @@ mod neon {
         fy_scale: u32,
         ab: Option<(u32, u32)>,
     ) -> usize {
+        // SAFETY: NEON is part of aarch64.
+        unsafe { export_expand_neon(dst, frow, irow, fy_scale, ab) }
+    }
+
+    #[target_feature(enable = "neon")]
+    #[inline]
+    fn export_expand_neon(
+        dst: &mut [u8],
+        frow: &[u32],
+        irow: &[u32],
+        fy_scale: u32,
+        ab: Option<(u32, u32)>,
+    ) -> usize {
         let n = dst.len() & !7;
-        assert!(frow.len() >= n && irow.len() >= n);
-        // SAFETY: every load and store ends within the first `n` samples of the rows.
-        unsafe {
-            let fy = half(fy_scale);
-            let row = |i: usize| {
-                let f = vld1q_u32(frow.as_ptr().add(i));
-                let Some((a, b)) = ab else { return f };
-                let g = vld1q_u32(irow.as_ptr().add(i));
-                let lo = vmlal_n_u32(vmull_n_u32(vget_low_u32(f), a), vget_low_u32(g), b);
-                let hi = vmlal_n_u32(vmull_n_u32(vget_high_u32(f), a), vget_high_u32(g), b);
-                vcombine_u32(vrshrn_n_u64::<32>(lo), vrshrn_n_u64::<32>(hi))
-            };
-            for i in (0..n).step_by(8) {
-                let d = narrow(mult_fix(row(i), fy), mult_fix(row(i + 4), fy));
-                vst1_u8(dst.as_mut_ptr().add(i), d);
-            }
+        let fy = half(fy_scale);
+        let row = |f: &[u32; 4], g: &[u32; 4]| {
+            let f = load(f);
+            let Some((a, b)) = ab else { return f };
+            let g = load(g);
+            let lo = vmlal_n_u32(vmull_n_u32(vget_low_u32(f), a), vget_low_u32(g), b);
+            let hi = vmlal_n_u32(vmull_n_u32(vget_high_u32(f), a), vget_high_u32(g), b);
+            vcombine_u32(vrshrn_n_u64::<32>(lo), vrshrn_n_u64::<32>(hi))
+        };
+        let dst = dst[..n].as_chunks_mut::<8>().0;
+        let frow = frow[..n].as_chunks::<4>().0.as_chunks::<2>().0;
+        let irow = irow[..n].as_chunks::<4>().0.as_chunks::<2>().0;
+        for ((d, f), g) in dst.iter_mut().zip(frow).zip(irow) {
+            store(d, narrow(mult_fix(row(&f[0], &g[0]), fy), mult_fix(row(&f[1], &g[1]), fy)));
         }
         n
     }
 
     /// `RescalerExportRowShrink_NEON`; returns how many samples it wrote.
+    #[allow(unsafe_code)]
     pub(super) fn export_shrink(
         dst: &mut [u8],
         irow: &mut [u32],
@@ -1193,28 +1242,35 @@ mod neon {
         yscale: u32,
         fxy_scale: u32,
     ) -> usize {
+        // SAFETY: NEON is part of aarch64.
+        unsafe { export_shrink_neon(dst, irow, frow, yscale, fxy_scale) }
+    }
+
+    #[target_feature(enable = "neon")]
+    #[inline]
+    fn export_shrink_neon(
+        dst: &mut [u8],
+        irow: &mut [u32],
+        frow: &[u32],
+        yscale: u32,
+        fxy_scale: u32,
+    ) -> usize {
         let n = dst.len() & !7;
-        assert!(irow.len() >= n && frow.len() >= n);
-        // SAFETY: every load and store ends within the first `n` samples of the rows.
-        unsafe {
-            let (ys, fxy) = (half(yscale), half(fxy_scale));
-            for i in (0..n).step_by(8) {
-                let ip = irow.as_mut_ptr().add(i);
-                let fp = frow.as_ptr().add(i);
-                let (mut a0, mut a1) = (vdupq_n_u32(0), vdupq_n_u32(0));
-                if yscale != 0 {
-                    a0 = mult_fix_floor(vld1q_u32(fp), ys);
-                    a1 = mult_fix_floor(vld1q_u32(fp.add(4)), ys);
-                }
-                let b0 = vqsubq_u32(vld1q_u32(ip), a0);
-                let b1 = vqsubq_u32(vld1q_u32(ip.add(4)), a1);
-                vst1_u8(
-                    dst.as_mut_ptr().add(i),
-                    narrow(mult_fix(b0, fxy), mult_fix(b1, fxy)),
-                );
-                vst1q_u32(ip, a0);
-                vst1q_u32(ip.add(4), a1);
+        let (ys, fxy) = (half(yscale), half(fxy_scale));
+        let dst = dst[..n].as_chunks_mut::<8>().0;
+        let irow = irow[..n].as_chunks_mut::<4>().0.as_chunks_mut::<2>().0;
+        let frow = frow[..n].as_chunks::<4>().0.as_chunks::<2>().0;
+        for ((d, [i0, i1]), [f0, f1]) in dst.iter_mut().zip(irow).zip(frow) {
+            let (mut a0, mut a1) = (vdupq_n_u32(0), vdupq_n_u32(0));
+            if yscale != 0 {
+                a0 = mult_fix_floor(load(f0), ys);
+                a1 = mult_fix_floor(load(f1), ys);
             }
+            let b0 = vqsubq_u32(load(&*i0), a0);
+            let b1 = vqsubq_u32(load(&*i1), a1);
+            store(d, narrow(mult_fix(b0, fxy), mult_fix(b1, fxy)));
+            store(i0, a0);
+            store(i1, a1);
         }
         n
     }
@@ -1421,7 +1477,8 @@ mod tests {
                 // SAFETY: the CPU has AVX2.
                 let done = unsafe { avx2::export_shrink(&mut a, &mut ia, &frow, yscale, fxy_scale) };
                 assert_eq!(done, n / 32 * 32);
-                sse2::export_shrink_from(&mut b, &mut ib, &frow, yscale, fxy_scale, 0);
+                // SAFETY: SSE2 is part of x86_64.
+                unsafe { sse2::export_shrink_from(&mut b, &mut ib, &frow, yscale, fxy_scale, 0) };
                 assert_eq!((&a[..done], &ia[..done]), (&b[..done], &ib[..done]), "{n}");
             }
         }

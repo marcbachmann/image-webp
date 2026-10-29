@@ -3,26 +3,17 @@
 //! `sse2` kernel it widens. Pixels are RGBA bytes.
 //!
 //! libwebp: Copyright Google Inc., BSD 3-Clause, see LICENSE-LIBWEBP.
-#![allow(unsafe_code)]
 
 use core::arch::x86_64::*;
 
 use super::sse2;
+use crate::simd_mem::{load, store};
 
-#[inline(always)]
-unsafe fn load8(p: *const u8) -> __m256i {
-    _mm256_loadu_si256(p.cast())
-}
-
-#[inline(always)]
-unsafe fn store8(p: *mut u8, v: __m256i) {
-    _mm256_storeu_si256(p.cast(), v)
-}
-
-/// libwebp's `TransformColorInverse_AVX2` over the first whole eights of the `n` pixels at `p`,
-/// with red and blue where RGBA keeps them.
-#[inline(always)]
-unsafe fn color_transform8(p: *mut u8, n: usize, red_to_blue: u8, green_to_blue: u8, green_to_red: u8) -> usize {
+/// libwebp's `TransformColorInverse_AVX2` over the whole eights of pixels of `p`, with red and
+/// blue where RGBA keeps them: the number of pixels done.
+#[target_feature(enable = "avx2")]
+#[inline]
+fn color_transform8(p: &mut [u8], red_to_blue: u8, green_to_blue: u8, green_to_red: u8) -> usize {
     let cst = |m: u8| i32::from(((m as i8 as i16) << 3) as u16);
     let mults_rb = _mm256_set1_epi32(cst(green_to_blue) << 16 | cst(green_to_red));
     let mults_b2 = _mm256_set1_epi32(cst(red_to_blue) << 16);
@@ -37,52 +28,45 @@ unsafe fn color_transform8(p: *mut u8, n: usize, red_to_blue: u8, green_to_blue:
         -1, -1, -1, 0, -1, -1, -1, 4, -1, -1, -1, 8, -1, -1, -1, 12,
         -1, -1, -1, 0, -1, -1, -1, 4, -1, -1, -1, 8, -1, -1, -1, 12,
     );
-    let mut i = 0;
-    while i + 8 <= n {
-        let a = load8(p.add(4 * i));
+    let eights = p.as_chunks_mut::<32>().0;
+    for c in eights.iter_mut() {
+        let a = load(c);
         let d = _mm256_add_epi8(a, _mm256_mulhi_epi16(_mm256_shuffle_epi8(a, perm1), mults_rb));
         let g = _mm256_add_epi8(d, _mm256_mulhi_epi16(_mm256_shuffle_epi8(d, perm2), mults_b2));
-        store8(p.add(4 * i), _mm256_blendv_epi8(g, a, mask_ag));
-        i += 8;
+        store(c, _mm256_blendv_epi8(g, a, mask_ag));
     }
-    i
+    eights.len() * 8
 }
 
 /// `sse2::color_transform_row` with the kernel above.
-///
-/// # Safety
-/// The CPU supports AVX2, and `mults` has a triple for each block of `row`.
 #[target_feature(enable = "avx2")]
-pub(crate) unsafe fn color_transform_row(row: &mut [u8], block: usize, mults: &[u8]) {
+pub(crate) fn color_transform_row(row: &mut [u8], block: usize, mults: &[u8]) {
     for (b, m) in row.chunks_mut(block * 4).zip(mults.as_chunks::<4>().0) {
-        let (p, n) = (b.as_mut_ptr(), b.len() / 4);
-        let done = color_transform8(p, n, m[0], m[1], m[2]);
-        sse2::color_transform(p.add(4 * done), n - done, m[0], m[1], m[2]);
+        let done = color_transform8(b, m[0], m[1], m[2]);
+        sse2::color_transform(&mut b[4 * done..], m[0], m[1], m[2]);
     }
 }
 
-/// libwebp's `AddGreenToBlueAndRed_AVX2` over the first whole eights of the `n` pixels at `p`.
-///
-/// # Safety
-/// The CPU supports AVX2, and `n` pixels at `p`.
+/// libwebp's `AddGreenToBlueAndRed_AVX2` over the whole eights of pixels of `image_data`: the
+/// number of pixels done.
 #[target_feature(enable = "avx2")]
-pub(crate) unsafe fn add_green(p: *mut u8, n: usize) -> usize {
+pub(crate) fn add_green(image_data: &mut [u8]) -> usize {
     #[rustfmt::skip]
     let green = _mm256_setr_epi8(
         1, -1, 1, -1, 5, -1, 5, -1, 9, -1, 9, -1, 13, -1, 13, -1,
         1, -1, 1, -1, 5, -1, 5, -1, 9, -1, 9, -1, 13, -1, 13, -1,
     );
-    let mut i = 0;
-    while i + 8 <= n {
-        let v = load8(p.add(4 * i));
-        store8(p.add(4 * i), _mm256_add_epi8(v, _mm256_shuffle_epi8(v, green)));
-        i += 8;
+    let eights = image_data.as_chunks_mut::<32>().0;
+    for c in eights.iter_mut() {
+        let v = load(c);
+        store(c, _mm256_add_epi8(v, _mm256_shuffle_epi8(v, green)));
     }
-    i
+    eights.len() * 8
 }
 
 /// Drops the alpha of the first whole eights of the pixels of `rgba` into `rgb`, where the CPU
 /// has AVX2: the number of pixels done.
+#[allow(unsafe_code)]
 pub(crate) fn rgb_from_rgba(rgba: &[u8], rgb: &mut [u8]) -> usize {
     if !crate::wide::has_avx2() {
         return 0;
@@ -92,34 +76,34 @@ pub(crate) fn rgb_from_rgba(rgba: &[u8], rgb: &mut [u8]) -> usize {
 }
 
 #[target_feature(enable = "avx2")]
-unsafe fn rgb_from_rgba8(rgba: &[u8], rgb: &mut [u8]) -> usize {
+fn rgb_from_rgba8(rgba: &[u8], rgb: &mut [u8]) -> usize {
     let n = (rgba.len() / 4).min(rgb.len() / 3);
-    let (src, dst) = (rgba.as_ptr(), rgb.as_mut_ptr());
+    let mut rgb = &mut rgb[..3 * n];
     #[rustfmt::skip]
     let pack = _mm256_setr_epi8(
         0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, -1, -1, -1, -1,
         0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, -1, -1, -1, -1,
     );
     let lanes = _mm256_setr_epi32(0, 1, 2, 4, 5, 6, 7, 7);
-    let mut i = 0;
-    while i + 8 <= n {
-        let v = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(load8(src.add(4 * i)), pack), lanes);
-        let d = dst.add(3 * i);
+    let eights = rgba[..4 * n].as_chunks::<32>().0;
+    for px in eights {
+        let v = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(load(px), pack), lanes);
         // The 24 bytes, as 32 where the next eight overwrite the last 8.
-        if 3 * i + 32 <= 3 * n {
-            store8(d, v);
+        if let Some(d) = rgb.first_chunk_mut::<32>() {
+            store(d, v);
         } else {
-            _mm_storeu_si128(d.cast(), _mm256_castsi256_si128(v));
-            _mm_storel_epi64(d.add(16).cast(), _mm256_extracti128_si256::<1>(v));
+            store(rgb, _mm256_castsi256_si128(v));
+            store(&mut rgb[16..], _mm_cvtsi128_si64(_mm256_extracti128_si256::<1>(v)));
         }
-        i += 8;
+        rgb = &mut core::mem::take(&mut rgb)[24..];
     }
-    i
+    eights.len() * 8
 }
 
 /// Inserts the first whole eights of the RGBA pixels `pixels` into a colour cache of `bits`
 /// bits, in order, where the CPU has AVX2: the number of pixels done. The eight hashes are
 /// taken at once, the stores one at a time, so a later pixel still wins a shared slot.
+#[allow(unsafe_code)]
 pub(crate) fn color_cache_insert(cache: &mut [u32; 1 << 11], bits: u8, pixels: &[u8]) -> usize {
     if !crate::wide::has_avx2() {
         return 0;
@@ -129,7 +113,7 @@ pub(crate) fn color_cache_insert(cache: &mut [u32; 1 << 11], bits: u8, pixels: &
 }
 
 #[target_feature(enable = "avx2")]
-unsafe fn color_cache_insert8(cache: &mut [u32; 1 << 11], bits: u8, pixels: &[u8]) -> usize {
+fn color_cache_insert8(cache: &mut [u32; 1 << 11], bits: u8, pixels: &[u8]) -> usize {
     // RGBA to libwebp's ARGB words.
     #[rustfmt::skip]
     let argb = _mm256_setr_epi8(
@@ -140,9 +124,8 @@ unsafe fn color_cache_insert8(cache: &mut [u32; 1 << 11], bits: u8, pixels: &[u8
     let mut slots = [0u32; 8];
     let (quads, _) = pixels.as_chunks::<32>();
     for q in quads {
-        let v = _mm256_loadu_si256(q.as_ptr().cast());
-        let hash = _mm256_mullo_epi32(_mm256_shuffle_epi8(v, argb), _mm256_set1_epi32(0x1e35a7bd));
-        _mm256_storeu_si256(slots.as_mut_ptr().cast(), _mm256_srl_epi32(hash, shift));
+        let hash = _mm256_mullo_epi32(_mm256_shuffle_epi8(load(q), argb), _mm256_set1_epi32(0x1e35a7bd));
+        store(&mut slots, _mm256_srl_epi32(hash, shift));
         for (&slot, px) in slots.iter().zip(q.as_chunks::<4>().0) {
             cache[slot as usize & ((1 << 11) - 1)] = u32::from_le_bytes(*px);
         }
@@ -152,6 +135,7 @@ unsafe fn color_cache_insert8(cache: &mut [u32; 1 << 11], bits: u8, pixels: &[u8
 
 /// libwebp's `WebPExtractGreen` over the first whole 32s of the RGBA pixels `rgba` into
 /// `green`, where the CPU has AVX2: the number of pixels done.
+#[allow(unsafe_code)]
 pub(crate) fn extract_green(rgba: &[u8], green: &mut [u8]) -> usize {
     if !crate::wide::has_avx2() {
         return 0;
@@ -161,24 +145,23 @@ pub(crate) fn extract_green(rgba: &[u8], green: &mut [u8]) -> usize {
 }
 
 #[target_feature(enable = "avx2")]
-unsafe fn extract_green32(rgba: &[u8], green: &mut [u8]) -> usize {
-    let n = (rgba.len() / 4).min(green.len());
-    let (src, dst) = (rgba.as_ptr(), green.as_mut_ptr());
-    let mut i = 0;
-    while i + 32 <= n {
-        let p = src.add(4 * i);
-        let g = |k: usize| _mm256_and_si256(_mm256_srli_epi32::<8>(load8(p.add(32 * k))), _mm256_set1_epi32(0xff));
+fn extract_green32(rgba: &[u8], green: &mut [u8]) -> usize {
+    let (src, dst) = (rgba.as_chunks::<128>().0, green.as_chunks_mut::<32>().0);
+    let mut done = 0;
+    for (p, d) in src.iter().zip(dst) {
+        let g = |k: usize| _mm256_and_si256(_mm256_srli_epi32::<8>(load(&p[32 * k..])), _mm256_set1_epi32(0xff));
         let bytes = _mm256_packus_epi16(_mm256_packus_epi32(g(0), g(1)), _mm256_packus_epi32(g(2), g(3)));
         // The packs interleave the four eights a lane each; dword k of lane l holds eight k's
         // pixels 4l to 4l + 3.
-        store8(dst.add(i), _mm256_permutevar8x32_epi32(bytes, _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7)));
-        i += 32;
+        store(d, _mm256_permutevar8x32_epi32(bytes, _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7)));
+        done += 32;
     }
-    i
+    done
 }
 
 /// libwebp's `WebPDispatchAlpha` over the first whole eights of `alpha` into the alpha of the
 /// RGBA pixels `rgba`, where the CPU has AVX2: the number of pixels done.
+#[allow(unsafe_code)]
 pub(crate) fn dispatch_alpha(alpha: &[u8], rgba: &mut [u8]) -> usize {
     if !crate::wide::has_avx2() {
         return 0;
@@ -188,28 +171,28 @@ pub(crate) fn dispatch_alpha(alpha: &[u8], rgba: &mut [u8]) -> usize {
 }
 
 #[target_feature(enable = "avx2")]
-unsafe fn dispatch_alpha8(alpha: &[u8], rgba: &mut [u8]) -> usize {
-    let n = alpha.len().min(rgba.len() / 4);
-    let (src, dst) = (alpha.as_ptr(), rgba.as_mut_ptr());
+fn dispatch_alpha8(alpha: &[u8], rgba: &mut [u8]) -> usize {
+    let (src, dst) = (alpha.as_chunks::<8>().0, rgba.as_chunks_mut::<32>().0);
     let rgb = _mm256_set1_epi32(0x00ff_ffff);
-    let mut i = 0;
-    while i + 8 <= n {
-        let a = _mm256_slli_epi32::<24>(_mm256_cvtepu8_epi32(_mm_loadl_epi64(src.add(i).cast())));
-        let p = dst.add(4 * i);
-        store8(p, _mm256_or_si256(_mm256_and_si256(load8(p), rgb), a));
-        i += 8;
+    let mut done = 0;
+    for (a, p) in src.iter().zip(dst) {
+        let a = _mm256_slli_epi32::<24>(_mm256_cvtepu8_epi32(_mm_cvtsi64_si128(load(a))));
+        let v = _mm256_or_si256(_mm256_and_si256(load(p), rgb), a);
+        store(p, v);
+        done += 8;
     }
-    i
+    done
 }
 
 /// The eight-pixel kernel alone, for the tests.
 #[cfg(test)]
 #[target_feature(enable = "avx2")]
-unsafe fn color_transform8_alone(p: *mut u8, n: usize, m: [u8; 4]) -> usize {
-    color_transform8(p, n, m[0], m[1], m[2])
+fn color_transform8_alone(p: &mut [u8], m: [u8; 4]) -> usize {
+    color_transform8(p, m[0], m[1], m[2])
 }
 
 #[cfg(test)]
+#[allow(unsafe_code)]
 mod tests {
     use rand::{Rng, SeedableRng};
 
@@ -324,13 +307,13 @@ mod tests {
                 let (mut a, mut b) = (data.clone(), data.clone());
                 scalar::apply_color_transform_portable(&mut a, width, 0, 9, &mults);
                 let n = usize::from(width);
-                let done = unsafe { super::color_transform8_alone(b.as_mut_ptr(), n, mults) };
+                let done = unsafe { super::color_transform8_alone(&mut b, mults) };
                 assert_eq!(done, n / 8 * 8);
                 assert_eq!(a[..done * 4], b[..done * 4], "width {width} {mults:?}");
                 assert_eq!(data[done * 4..], b[done * 4..]);
                 let (mut a, mut b) = (data.clone(), data.clone());
                 scalar::apply_subtract_green_portable(&mut a);
-                let done = unsafe { super::add_green(b.as_mut_ptr(), n) };
+                let done = unsafe { super::add_green(&mut b) };
                 assert_eq!(done, n / 8 * 8);
                 assert_eq!(a[..done * 4], b[..done * 4]);
                 assert_eq!(data[done * 4..], b[done * 4..]);
