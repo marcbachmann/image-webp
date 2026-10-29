@@ -119,7 +119,7 @@ fn predict<const M: usize>(l: __m256i, tl: __m256i, t: __m256i, tr: __m256i) -> 
 #[target_feature(enable = "avx2")]
 pub(super) fn sub_batch<const M: usize>(cur: &[u32], up: &[u32], out: &mut [u32]) -> usize {
     let n = out.len() & !7;
-    let groups = neighbour_groups::<8>(cur, up, 0, n);
+    let groups = neighbour_groups::<8>(cur, up, n);
     for (o, [l, x, tl, t, tr]) in out[..n].as_chunks_mut::<8>().0.iter_mut().zip(groups) {
         let pred = predict::<M>(load(l), load(tl), load(t), load(tr));
         store(o, _mm256_sub_epi8(load(x), pred));
@@ -135,7 +135,7 @@ pub(super) fn sub_batch_opaque<const M: usize>(
     out: &mut [u32],
 ) -> usize {
     let n = out.len() & !7;
-    let groups = neighbour_groups::<8>(cur, up, 0, n);
+    let groups = neighbour_groups::<8>(cur, up, n);
     let mut i = 0;
     for (o, [l, x, tl, t, tr]) in out[..n].as_chunks_mut::<8>().0.iter_mut().zip(groups) {
         let x = load(x);

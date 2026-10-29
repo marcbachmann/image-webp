@@ -88,7 +88,7 @@ pub(super) fn sub_batch<const M: usize>(cur: &[u32], up: &[u32], out: &mut [u32]
 #[inline]
 fn sub_batch_neon<const M: usize>(cur: &[u32], up: &[u32], out: &mut [u32]) -> usize {
     let n = out.len() & !3;
-    let groups = neighbour_groups::<4>(cur, up, 0, n);
+    let groups = neighbour_groups::<4>(cur, up, n);
     for (o, [l, x, tl, t, tr]) in out[..n].as_chunks_mut::<4>().0.iter_mut().zip(groups) {
         let pred = predict::<M>(load(l), load(tl), load(t), load(tr));
         store(o, vsubq_u8(load(x), pred));
@@ -109,7 +109,7 @@ pub(super) fn sub_batch_opaque<const M: usize>(cur: &[u32], up: &[u32], out: &mu
 #[inline]
 fn sub_batch_opaque_neon<const M: usize>(cur: &[u32], up: &[u32], out: &mut [u32]) -> usize {
     let n = out.len() & !3;
-    let groups = neighbour_groups::<4>(cur, up, 0, n);
+    let groups = neighbour_groups::<4>(cur, up, n);
     let mut i = 0;
     for (o, [l, x, tl, t, tr]) in out[..n].as_chunks_mut::<4>().0.iter_mut().zip(groups) {
         let x: uint8x16_t = load(x);

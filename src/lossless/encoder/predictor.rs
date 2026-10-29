@@ -102,24 +102,22 @@ pub(super) fn predict<const M: usize>(left: u32, tl: u32, t: u32, tr: u32) -> u3
     }
 }
 
-/// The groups of `W` pixels `cur[i + 1..i + 1 + W]` for `i` from `from` to `n` (a multiple of `W`
-/// apart): each as its left, current, top-left, top and top-right neighbours, the latter three
-/// from `up[i..]`. Fixed-size chunks of shifted views, so the SIMD kernels load them unchecked.
+/// The groups of `W` pixels `cur[i + 1..i + 1 + W]` for `i` up to `n` (a multiple of `W`): each
+/// as its left, current, top-left, top and top-right neighbours, the latter three from `up[i..]`.
+/// Fixed-size chunks of equally long views, so the SIMD kernels load them unchecked.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[inline(always)]
 pub(super) fn neighbour_groups<'a, const W: usize>(
     cur: &'a [u32],
     up: &'a [u32],
-    from: usize,
     n: usize,
 ) -> impl Iterator<Item = [&'a [u32; W]; 5]> + 'a {
-    let m = n - from;
-    let (cur, up) = (&cur[from..n + 1], &up[from..n + 2]);
-    let l = cur[..m].as_chunks::<W>().0;
-    let x = cur[1..m + 1].as_chunks::<W>().0;
-    let tl = up[..m].as_chunks::<W>().0;
-    let t = up[1..m + 1].as_chunks::<W>().0;
-    let tr = up[2..m + 2].as_chunks::<W>().0;
+    let (cur, up) = (&cur[..n + 1], &up[..n + 2]);
+    let l = cur[..n].as_chunks::<W>().0;
+    let x = cur[1..].as_chunks::<W>().0;
+    let tl = up[..n].as_chunks::<W>().0;
+    let t = up[1..n + 1].as_chunks::<W>().0;
+    let tr = up[2..].as_chunks::<W>().0;
     l.iter()
         .zip(x)
         .zip(tl)

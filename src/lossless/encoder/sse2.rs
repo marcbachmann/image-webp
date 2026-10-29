@@ -5,7 +5,7 @@
 use core::arch::x86_64::*;
 
 use super::predictor::neighbour_groups;
-use crate::simd_mem::{load, load_at, store};
+use crate::simd_mem::{load, load_at, store, store_at};
 
 #[target_feature(enable = "sse2")]
 #[inline]
@@ -106,21 +106,48 @@ fn predict<const M: usize>(l: __m128i, tl: __m128i, t: __m128i, tr: __m128i) -> 
 #[allow(unsafe_code)]
 #[inline(always)]
 pub(super) fn sub_batch<const M: usize>(cur: &[u32], up: &[u32], out: &mut [u32]) -> usize {
-    let mut i = 0;
     if crate::wide::has_avx2() {
         // SAFETY: the CPU supports AVX2.
-        i = unsafe { super::avx2::sub_batch::<M>(cur, up, out) };
+        let i = unsafe { super::avx2::sub_batch::<M>(cur, up, out) };
+        // SAFETY: SSE2 is part of x86_64.
+        return unsafe { sub_group::<M, false>(cur, up, out, i) };
     }
     // SAFETY: SSE2 is part of x86_64.
-    unsafe { sub_batch_from::<M>(cur, up, out, i) }
+    unsafe { sub_batch_sse2::<M>(cur, up, out) }
+}
+
+/// The one group of four that can follow the AVX2 kernels' groups of eight: at `i` if it is
+/// below `out.len() & !3` (and, for `OPAQUE`, has no fully transparent pixel). Returns how
+/// many pixels are done.
+#[target_feature(enable = "sse2")]
+#[inline]
+fn sub_group<const M: usize, const OPAQUE: bool>(
+    cur: &[u32],
+    up: &[u32],
+    out: &mut [u32],
+    i: usize,
+) -> usize {
+    if i >= out.len() & !3 {
+        return i;
+    }
+    let x = load_at(cur, i + 1);
+    if OPAQUE {
+        let alpha_zero = _mm_cmpeq_epi32(_mm_srli_epi32(x, 24), _mm_setzero_si128());
+        if _mm_movemask_epi8(alpha_zero) != 0 {
+            return i;
+        }
+    }
+    let pred = predict::<M>(load_at(cur, i), load_at(up, i), load_at(up, i + 1), load_at(up, i + 2));
+    store_at(out, i, _mm_sub_epi8(x, pred));
+    i + 4
 }
 
 #[target_feature(enable = "sse2")]
 #[inline]
-fn sub_batch_from<const M: usize>(cur: &[u32], up: &[u32], out: &mut [u32], from: usize) -> usize {
+fn sub_batch_sse2<const M: usize>(cur: &[u32], up: &[u32], out: &mut [u32]) -> usize {
     let n = out.len() & !3;
-    let groups = neighbour_groups::<4>(cur, up, from, n);
-    for (o, [l, x, tl, t, tr]) in out[from..n].as_chunks_mut::<4>().0.iter_mut().zip(groups) {
+    let groups = neighbour_groups::<4>(cur, up, n);
+    for (o, [l, x, tl, t, tr]) in out[..n].as_chunks_mut::<4>().0.iter_mut().zip(groups) {
         let pred = predict::<M>(load(l), load(tl), load(t), load(tr));
         store(o, _mm_sub_epi8(load(x), pred));
     }
@@ -132,27 +159,23 @@ fn sub_batch_from<const M: usize>(cur: &[u32], up: &[u32], out: &mut [u32], from
 #[allow(unsafe_code)]
 #[inline(always)]
 pub(super) fn sub_batch_opaque<const M: usize>(cur: &[u32], up: &[u32], out: &mut [u32]) -> usize {
-    let mut i = 0;
     if crate::wide::has_avx2() {
         // SAFETY: the CPU supports AVX2.
-        i = unsafe { super::avx2::sub_batch_opaque::<M>(cur, up, out) };
+        let i = unsafe { super::avx2::sub_batch_opaque::<M>(cur, up, out) };
+        // SAFETY: SSE2 is part of x86_64.
+        return unsafe { sub_group::<M, true>(cur, up, out, i) };
     }
     // SAFETY: SSE2 is part of x86_64.
-    unsafe { sub_batch_opaque_from::<M>(cur, up, out, i) }
+    unsafe { sub_batch_opaque_sse2::<M>(cur, up, out) }
 }
 
 #[target_feature(enable = "sse2")]
 #[inline]
-fn sub_batch_opaque_from<const M: usize>(
-    cur: &[u32],
-    up: &[u32],
-    out: &mut [u32],
-    from: usize,
-) -> usize {
+fn sub_batch_opaque_sse2<const M: usize>(cur: &[u32], up: &[u32], out: &mut [u32]) -> usize {
     let n = out.len() & !3;
-    let groups = neighbour_groups::<4>(cur, up, from, n);
-    let mut i = from;
-    for (o, [l, x, tl, t, tr]) in out[from..n].as_chunks_mut::<4>().0.iter_mut().zip(groups) {
+    let groups = neighbour_groups::<4>(cur, up, n);
+    let mut i = 0;
+    for (o, [l, x, tl, t, tr]) in out[..n].as_chunks_mut::<4>().0.iter_mut().zip(groups) {
         let x = load(x);
         let alpha_zero = _mm_cmpeq_epi32(_mm_srli_epi32(x, 24), _mm_setzero_si128());
         if _mm_movemask_epi8(alpha_zero) != 0 {
