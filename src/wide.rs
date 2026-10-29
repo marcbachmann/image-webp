@@ -50,6 +50,6 @@ pub(crate) fn wide<R>(f: impl FnOnce() -> R) -> R {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn avx2<R>(f: impl FnOnce() -> R) -> R {
+fn avx2<R>(f: impl FnOnce() -> R) -> R {
     f()
 }

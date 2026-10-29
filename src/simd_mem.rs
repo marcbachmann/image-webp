@@ -80,6 +80,7 @@ fn rows_fit(len: usize, at: usize, stride: usize, n: usize, size: usize) -> bool
 }
 
 /// `N` values of `V` from `src`, at `at`, `at + stride`, ..., checked once.
+#[cfg(target_arch = "aarch64")]
 #[inline(always)]
 pub(crate) fn load_rows<V: Pod, const N: usize>(src: &[u8], at: usize, stride: usize) -> [V; N] {
     assert!(rows_fit(src.len(), at, stride, N, size_of::<V>()));
@@ -89,6 +90,7 @@ pub(crate) fn load_rows<V: Pod, const N: usize>(src: &[u8], at: usize, stride: u
 }
 
 /// Writes `rows` to `dst` at `at`, `at + stride`, ..., checked once.
+#[cfg(target_arch = "aarch64")]
 #[inline(always)]
 pub(crate) fn store_rows<V: Pod, const N: usize>(dst: &mut [u8], at: usize, stride: usize, rows: [V; N]) {
     assert!(rows_fit(dst.len(), at, stride, N, size_of::<V>()));
@@ -130,8 +132,6 @@ pub(crate) mod neon {
     ld! {
         vld3q_u8(u8) -> uint8x16x3_t, 48;
         vld4q_u8(u8) -> uint8x16x4_t, 64;
-        vld3_u8(u8) -> uint8x8x3_t, 24;
-        vld4_u8(u8) -> uint8x8x4_t, 32;
     }
 
     st! {
