@@ -33,6 +33,7 @@ mod extended;
 mod frame;
 pub mod headers;
 mod rescaler;
+mod simd_mem;
 mod wide;
 mod lossless;
 mod lossy;

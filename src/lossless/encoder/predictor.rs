@@ -102,6 +102,32 @@ pub(super) fn predict<const M: usize>(left: u32, tl: u32, t: u32, tr: u32) -> u3
     }
 }
 
+/// The groups of `W` pixels `cur[i + 1..i + 1 + W]` for `i` from `from` to `n` (a multiple of `W`
+/// apart): each as its left, current, top-left, top and top-right neighbours, the latter three
+/// from `up[i..]`. Fixed-size chunks of shifted views, so the SIMD kernels load them unchecked.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[inline(always)]
+pub(super) fn neighbour_groups<'a, const W: usize>(
+    cur: &'a [u32],
+    up: &'a [u32],
+    from: usize,
+    n: usize,
+) -> impl Iterator<Item = [&'a [u32; W]; 5]> + 'a {
+    let m = n - from;
+    let (cur, up) = (&cur[from..n + 1], &up[from..n + 2]);
+    let l = cur[..m].as_chunks::<W>().0;
+    let x = cur[1..m + 1].as_chunks::<W>().0;
+    let tl = up[..m].as_chunks::<W>().0;
+    let t = up[1..m + 1].as_chunks::<W>().0;
+    let tr = up[2..m + 2].as_chunks::<W>().0;
+    l.iter()
+        .zip(x)
+        .zip(tl)
+        .zip(t)
+        .zip(tr)
+        .map(|((((l, x), tl), t), tr)| [l, x, tl, t, tr])
+}
+
 /// Residuals of `current[x0..x0 + out.len()]` (x0 > 0) against mode `M`.
 fn sub_batch<const M: usize>(current: &[u32], upper: &[u32], x0: usize, out: &mut [u32]) {
     let n = out.len();
