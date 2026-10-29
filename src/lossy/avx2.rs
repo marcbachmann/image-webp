@@ -2,19 +2,23 @@
 //! `sse2.rs` 256 bits wide, bit-exact with them. Callers check [`crate::wide::has_avx2`] first.
 //!
 //! libwebp: Copyright Google Inc., BSD 3-Clause, see LICENSE-LIBWEBP.
-#![allow(unsafe_code)]
 
 use core::arch::x86_64::*;
 
-/// 16 bytes at `p` in the low lane, 16 at `p + 32` in the high one.
-#[inline(always)]
-unsafe fn load_lanes(p: *const u8) -> __m256i {
-    _mm256_loadu2_m128i(p.add(32).cast(), p.cast())
+use super::sse2::{load16x4, load_uv, store16x4, store4x4, store_uv};
+use crate::simd_mem::{load, store, Rows};
+
+/// 16 bytes from `at` in the low lane, 16 from `at + 32` in the high one.
+#[target_feature(enable = "avx2")]
+#[inline]
+fn load_lanes(p: &[u8; 64], at: usize) -> __m256i {
+    _mm256_set_m128i(load(&p[at + 32..]), load(&p[at..]))
 }
 
 /// `yuv444_to_rgb` of `sse2.rs` on 16 pixels whose luma and chroma are in the high bytes.
-#[inline(always)]
-unsafe fn yuv444_to_rgb(y0: __m256i, u0: __m256i, v0: __m256i) -> [__m256i; 3] {
+#[target_feature(enable = "avx2")]
+#[inline]
+fn yuv444_to_rgb(y0: __m256i, u0: __m256i, v0: __m256i) -> [__m256i; 3] {
     let y1 = _mm256_mulhi_epu16(y0, _mm256_set1_epi16(19077));
     let r0 = _mm256_mulhi_epu16(v0, _mm256_set1_epi16(26149));
     let r2 = _mm256_add_epi16(_mm256_sub_epi16(y1, _mm256_set1_epi16(14234)), r0);
@@ -33,8 +37,9 @@ unsafe fn yuv444_to_rgb(y0: __m256i, u0: __m256i, v0: __m256i) -> [__m256i; 3] {
     ]
 }
 
-#[inline(always)]
-unsafe fn planar_to_24b_step(i: [__m256i; 6]) -> [__m256i; 6] {
+#[target_feature(enable = "avx2")]
+#[inline]
+fn planar_to_24b_step(i: [__m256i; 6]) -> [__m256i; 6] {
     let m = _mm256_set1_epi16(0x00ff);
     let even = |a, b| _mm256_packus_epi16(_mm256_and_si256(a, m), _mm256_and_si256(b, m));
     let odd = |a, b| _mm256_packus_epi16(_mm256_srli_epi16::<8>(a), _mm256_srli_epi16::<8>(b));
@@ -48,33 +53,40 @@ unsafe fn planar_to_24b_step(i: [__m256i; 6]) -> [__m256i; 6] {
     ]
 }
 
-#[inline(always)]
-unsafe fn store_lo(p: *mut u8, x: __m256i) {
-    _mm_storeu_si128(p.cast(), _mm256_castsi256_si128(x));
+#[target_feature(enable = "avx2")]
+#[inline]
+fn store_lo(dst: &mut [u8], x: __m256i) {
+    store(dst, _mm256_castsi256_si128(x));
 }
 
-#[inline(always)]
-unsafe fn store_hi(p: *mut u8, x: __m256i) {
-    _mm_storeu_si128(p.cast(), _mm256_extracti128_si256::<1>(x));
+#[target_feature(enable = "avx2")]
+#[inline]
+fn store_hi(dst: &mut [u8], x: __m256i) {
+    store(dst, _mm256_extracti128_si256::<1>(x));
 }
 
 /// `sse2::yuv_to_rgb_row` 64 (RGB) or 16 (RGBA) pixels at a time: RGB runs libwebp's
 /// `VP8YuvToRgb32_SSE2` on two blocks of 32 pixels, one in each lane.
 #[target_feature(enable = "avx2")]
-pub(crate) unsafe fn yuv_to_rgb_row<const BPP: usize>(
+pub(crate) fn yuv_to_rgb_row<const BPP: usize>(
     y: &[u8],
     u: &[u8],
     v: &[u8],
     out: &mut [u8],
 ) -> usize {
     let n = y.len().min(u.len()).min(v.len()).min(out.len() / BPP);
-    let mut i = 0;
-    let (y, u, v, out) = (y.as_ptr(), u.as_ptr(), v.as_ptr(), out.as_mut_ptr());
     let zero = _mm256_setzero_si256();
     if BPP == 3 {
-        while i + 64 <= n {
-            let [ya, ua, va] = [y, u, v].map(|p| load_lanes(p.add(i)));
-            let [yb, ub, vb] = [y, u, v].map(|p| load_lanes(p.add(i + 16)));
+        let m = n / 64 * 64;
+        let yuv = y[..m]
+            .as_chunks::<64>()
+            .0
+            .iter()
+            .zip(u[..m].as_chunks::<64>().0);
+        let yuv = yuv.zip(v[..m].as_chunks::<64>().0);
+        for (o, ((y, u), v)) in out[..3 * m].as_chunks_mut::<192>().0.iter_mut().zip(yuv) {
+            let (ya, ua, va) = (load_lanes(y, 0), load_lanes(u, 0), load_lanes(v, 0));
+            let (yb, ub, vb) = (load_lanes(y, 16), load_lanes(u, 16), load_lanes(v, 16));
             let lo = |x| _mm256_unpacklo_epi8(zero, x);
             let hi = |x| _mm256_unpackhi_epi8(zero, x);
             let [r0, g0, b0] = yuv444_to_rgb(lo(ya), lo(ua), lo(va));
@@ -93,45 +105,64 @@ pub(crate) unsafe fn yuv_to_rgb_row<const BPP: usize>(
                 c = planar_to_24b_step(c);
             }
             for (k, x) in c.into_iter().enumerate() {
-                store_lo(out.add(3 * i + 16 * k), x);
-                store_hi(out.add(3 * i + 96 + 16 * k), x);
+                store_lo(&mut o[16 * k..], x);
+                store_hi(&mut o[96 + 16 * k..], x);
             }
-            i += 64;
         }
+        m
     } else {
+        let m = n / 16 * 16;
         let alpha = _mm256_set1_epi16(255);
-        let load = |p: *const u8| {
-            _mm256_slli_epi16::<8>(_mm256_cvtepu8_epi16(_mm_loadu_si128(p.cast())))
-        };
-        while i + 16 <= n {
-            let [r, g, b] = yuv444_to_rgb(load(y.add(i)), load(u.add(i)), load(v.add(i)));
+        let widen = |p: &[u8; 16]| _mm256_slli_epi16::<8>(_mm256_cvtepu8_epi16(load(p)));
+        let yuv = y[..m]
+            .as_chunks::<16>()
+            .0
+            .iter()
+            .zip(u[..m].as_chunks::<16>().0);
+        let yuv = yuv.zip(v[..m].as_chunks::<16>().0);
+        for (o, ((y, u), v)) in out[..4 * m].as_chunks_mut::<64>().0.iter_mut().zip(yuv) {
+            let [r, g, b] = yuv444_to_rgb(widen(y), widen(u), widen(v));
             let rb = _mm256_packus_epi16(r, b);
             let ga = _mm256_packus_epi16(g, alpha);
             let rg = _mm256_unpacklo_epi8(rb, ga);
             let ba = _mm256_unpackhi_epi8(rb, ga);
             let (lo, hi) = (_mm256_unpacklo_epi16(rg, ba), _mm256_unpackhi_epi16(rg, ba));
-            let p = out.add(4 * i);
-            store_lo(p, lo);
-            store_lo(p.add(16), hi);
-            store_hi(p.add(32), lo);
-            store_hi(p.add(48), hi);
-            i += 16;
+            store_lo(&mut o[..16], lo);
+            store_lo(&mut o[16..], hi);
+            store_hi(&mut o[32..], lo);
+            store_hi(&mut o[48..], hi);
         }
+        m
     }
-    i
 }
 
 /// `sse2::upsample_pairs` 32 pairs at a time, libwebp's `UPSAMPLE_32PIXELS` on 256 bits.
 #[target_feature(enable = "avx2")]
-pub(crate) unsafe fn upsample_pairs(near: &[u8], far: &[u8], out: &mut [u8]) -> usize {
+pub(crate) fn upsample_pairs(near: &[u8], far: &[u8], out: &mut [u8]) -> usize {
     let n = near.len().min(far.len());
     let pairs = (out.len().saturating_sub(1) / 2).min(n.saturating_sub(1));
-    let mut j = 0;
-    let load = |p: &[u8], k: usize| _mm256_loadu_si256(p.as_ptr().add(k).cast());
+    let m = pairs / 32 * 32;
+    if m == 0 {
+        return 0;
+    }
     let one = _mm256_set1_epi8(1);
-    while j + 32 <= pairs && j + 33 <= n {
-        let (a, b) = (load(near, j), load(near, j + 1));
-        let (c, d) = (load(far, j), load(far, j + 1));
+    let ab = near[..m]
+        .as_chunks::<32>()
+        .0
+        .iter()
+        .zip(near[1..m + 1].as_chunks::<32>().0);
+    let cd = far[..m]
+        .as_chunks::<32>()
+        .0
+        .iter()
+        .zip(far[1..m + 1].as_chunks::<32>().0);
+    for (o, ((a, b), (c, d))) in out[1..2 * m + 1]
+        .as_chunks_mut::<64>()
+        .0
+        .iter_mut()
+        .zip(ab.zip(cd))
+    {
+        let (a, b, c, d) = (load(a), load(b), load(c), load(d));
         let s = _mm256_avg_epu8(a, d);
         let t = _mm256_avg_epu8(b, c);
         let st = _mm256_xor_si256(s, t);
@@ -148,46 +179,50 @@ pub(crate) unsafe fn upsample_pairs(near: &[u8], far: &[u8], out: &mut [u8]) -> 
         };
         let even = _mm256_avg_epu8(a, get_m(bc, t));
         let odd = _mm256_avg_epu8(b, get_m(ad, s));
-        let (lo, hi) = (_mm256_unpacklo_epi8(even, odd), _mm256_unpackhi_epi8(even, odd));
-        let p = out.as_mut_ptr().add(2 * j + 1);
-        store_lo(p, lo);
-        store_lo(p.add(16), hi);
-        store_hi(p.add(32), lo);
-        store_hi(p.add(48), hi);
-        j += 32;
+        let (lo, hi) = (
+            _mm256_unpacklo_epi8(even, odd),
+            _mm256_unpackhi_epi8(even, odd),
+        );
+        store_lo(&mut o[..16], lo);
+        store_lo(&mut o[16..], hi);
+        store_hi(&mut o[32..], lo);
+        store_hi(&mut o[48..], hi);
     }
-    j
+    m
 }
 
-use super::sse2::{load16, load16x4, load_uv, rd32, store16, store16x4, store4x4, store_uv};
-
-#[inline(always)]
-unsafe fn abs_diff(p: __m256i, q: __m256i) -> __m256i {
+#[target_feature(enable = "avx2")]
+#[inline]
+fn abs_diff(p: __m256i, q: __m256i) -> __m256i {
     _mm256_or_si256(_mm256_subs_epu8(q, p), _mm256_subs_epu8(p, q))
 }
 
-#[inline(always)]
-unsafe fn flip(x: __m256i) -> __m256i {
+#[target_feature(enable = "avx2")]
+#[inline]
+fn flip(x: __m256i) -> __m256i {
     _mm256_xor_si256(x, _mm256_set1_epi8(-128))
 }
 
-#[inline(always)]
-unsafe fn signed_shift8b(x: __m256i) -> __m256i {
+#[target_feature(enable = "avx2")]
+#[inline]
+fn signed_shift8b(x: __m256i) -> __m256i {
     let zero = _mm256_setzero_si256();
     let lo = _mm256_srai_epi16::<11>(_mm256_unpacklo_epi8(zero, x));
     let hi = _mm256_srai_epi16::<11>(_mm256_unpackhi_epi8(zero, x));
     _mm256_packs_epi16(lo, hi)
 }
 
-#[inline(always)]
-unsafe fn not_hev(p1: __m256i, p0: __m256i, q0: __m256i, q1: __m256i, hev_thresh: u8) -> __m256i {
+#[target_feature(enable = "avx2")]
+#[inline]
+fn not_hev(p1: __m256i, p0: __m256i, q0: __m256i, q1: __m256i, hev_thresh: u8) -> __m256i {
     let t_max = _mm256_max_epu8(abs_diff(p1, p0), abs_diff(q1, q0));
     let t_max_h = _mm256_subs_epu8(t_max, _mm256_set1_epi8(hev_thresh as i8));
     _mm256_cmpeq_epi8(t_max_h, _mm256_setzero_si256())
 }
 
-#[inline(always)]
-unsafe fn base_delta(p1: __m256i, p0: __m256i, q0: __m256i, q1: __m256i) -> __m256i {
+#[target_feature(enable = "avx2")]
+#[inline]
+fn base_delta(p1: __m256i, p0: __m256i, q0: __m256i, q1: __m256i) -> __m256i {
     let p1_q1 = _mm256_subs_epi8(p1, q1);
     let q0_p0 = _mm256_subs_epi8(q0, p0);
     let s1 = _mm256_adds_epi8(p1_q1, q0_p0);
@@ -195,15 +230,17 @@ unsafe fn base_delta(p1: __m256i, p0: __m256i, q0: __m256i, q1: __m256i) -> __m2
     _mm256_adds_epi8(q0_p0, s2)
 }
 
-#[inline(always)]
-unsafe fn update_2_pixels(pi: &mut __m256i, qi: &mut __m256i, a0_lo: __m256i, a0_hi: __m256i) {
+#[target_feature(enable = "avx2")]
+#[inline]
+fn update_2_pixels(pi: &mut __m256i, qi: &mut __m256i, a0_lo: __m256i, a0_hi: __m256i) {
     let delta = _mm256_packs_epi16(_mm256_srai_epi16::<7>(a0_lo), _mm256_srai_epi16::<7>(a0_hi));
     *pi = flip(_mm256_adds_epi8(*pi, delta));
     *qi = flip(_mm256_subs_epi8(*qi, delta));
 }
 
-#[inline(always)]
-unsafe fn needs_filter(p1: __m256i, p0: __m256i, q0: __m256i, q1: __m256i, thresh: u8) -> __m256i {
+#[target_feature(enable = "avx2")]
+#[inline]
+fn needs_filter(p1: __m256i, p0: __m256i, q0: __m256i, q1: __m256i, thresh: u8) -> __m256i {
     let t3 = _mm256_srli_epi16::<1>(_mm256_and_si256(abs_diff(p1, q1), _mm256_set1_epi8(-2)));
     let t4 = abs_diff(p0, q0);
     let t6 = _mm256_adds_epu8(_mm256_adds_epu8(t4, t4), t3);
@@ -211,8 +248,9 @@ unsafe fn needs_filter(p1: __m256i, p0: __m256i, q0: __m256i, q1: __m256i, thres
     _mm256_cmpeq_epi8(t7, _mm256_setzero_si256())
 }
 
-#[inline(always)]
-unsafe fn do_filter4(
+#[target_feature(enable = "avx2")]
+#[inline]
+fn do_filter4(
     p1: &mut __m256i,
     p0: &mut __m256i,
     q0: &mut __m256i,
@@ -234,7 +272,10 @@ unsafe fn do_filter4(
     *q0 = flip(_mm256_subs_epi8(sq0, t3));
     // signed (t3 + 1) >> 1
     let t3 = _mm256_sub_epi8(
-        _mm256_avg_epu8(_mm256_add_epi8(t3, _mm256_set1_epi8(-128)), _mm256_setzero_si256()),
+        _mm256_avg_epu8(
+            _mm256_add_epi8(t3, _mm256_set1_epi8(-128)),
+            _mm256_setzero_si256(),
+        ),
         _mm256_set1_epi8(64),
     );
     let t3 = _mm256_and_si256(not_hev, t3);
@@ -242,9 +283,10 @@ unsafe fn do_filter4(
     *p1 = flip(_mm256_adds_epi8(sp1, t3));
 }
 
-#[inline(always)]
+#[target_feature(enable = "avx2")]
+#[inline]
 #[allow(clippy::too_many_arguments)]
-unsafe fn do_filter6(
+fn do_filter6(
     p2: &mut __m256i,
     p1: &mut __m256i,
     p0: &mut __m256i,
@@ -256,8 +298,14 @@ unsafe fn do_filter6(
 ) {
     let zero = _mm256_setzero_si256();
     let not_hev = not_hev(*p1, *p0, *q0, *q1, hev_thresh);
-    let (sp2, sp1, mut sp0, mut sq0, sq1, sq2) =
-        (flip(*p2), flip(*p1), flip(*p0), flip(*q0), flip(*q1), flip(*q2));
+    let (sp2, sp1, mut sp0, mut sq0, sq1, sq2) = (
+        flip(*p2),
+        flip(*p1),
+        flip(*p0),
+        flip(*q0),
+        flip(*q1),
+        flip(*q2),
+    );
     let a = base_delta(sp1, sp0, sq0, sq1);
     let fl = _mm256_and_si256(a, _mm256_andnot_si256(not_hev, mask));
     let v3 = signed_shift8b(_mm256_adds_epi8(fl, _mm256_set1_epi8(3)));
@@ -282,16 +330,18 @@ unsafe fn do_filter6(
     update_2_pixels(p0, q0, a0_lo, a0_hi);
 }
 
-#[inline(always)]
-unsafe fn max_diff(m: __m256i, p3: __m256i, p2: __m256i, p1: __m256i, p0: __m256i) -> __m256i {
+#[target_feature(enable = "avx2")]
+#[inline]
+fn max_diff(m: __m256i, p3: __m256i, p2: __m256i, p1: __m256i, p0: __m256i) -> __m256i {
     let m = _mm256_max_epu8(m, abs_diff(p1, p0));
     let m = _mm256_max_epu8(m, abs_diff(p3, p2));
     _mm256_max_epu8(m, abs_diff(p2, p1))
 }
 
-#[inline(always)]
+#[target_feature(enable = "avx2")]
+#[inline]
 #[allow(clippy::too_many_arguments)]
-unsafe fn complex_mask(
+fn complex_mask(
     p1: __m256i,
     p0: __m256i,
     q0: __m256i,
@@ -305,108 +355,132 @@ unsafe fn complex_mask(
     _mm256_and_si256(thresh_mask, needs_filter(p1, p0, q0, q1, thresh))
 }
 
-/// A luma plane in the low lanes and the two chroma planes in the high ones.
-#[derive(Clone, Copy)]
-struct Planes {
-    y: *mut u8,
-    ys: usize,
-    u: *mut u8,
-    v: *mut u8,
-    cs: usize,
+/// The rows a macroblock's normal filter reaches: a luma plane in the low lanes and the two
+/// chroma planes in the high ones, the macroblock from byte `left` of their rows on.
+struct Planes<'a, const YN: usize, const YW: usize, const CN: usize, const CW: usize> {
+    y: Rows<'a, YN, YW>,
+    u: Rows<'a, CN, CW>,
+    v: Rows<'a, CN, CW>,
+    left: usize,
 }
 
-impl Planes {
-    #[inline(always)]
-    fn at(self, dy: isize, dc: isize) -> Self {
-        Self {
-            y: self.y.wrapping_offset(dy),
-            u: self.u.wrapping_offset(dc),
-            v: self.v.wrapping_offset(dc),
-            ..self
-        }
-    }
-
+impl<const YN: usize, const YW: usize, const CN: usize, const CW: usize>
+    Planes<'_, YN, YW, CN, CW>
+{
     /// Row `k` of the luma plane beside row `k` of the chroma planes.
-    #[inline(always)]
-    unsafe fn row(self, k: isize) -> __m256i {
-        let (y, c) = (k * self.ys as isize, k * self.cs as isize);
-        _mm256_set_m128i(
-            load_uv(self.u.offset(c), self.v.offset(c)),
-            load16(self.y.offset(y)),
-        )
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn row(&self, k: usize) -> __m256i {
+        let x = self.left;
+        _mm256_set_m128i(load_uv(&self.u, &self.v, k, x), self.y.load(k, x))
     }
 
-    #[inline(always)]
-    unsafe fn store_row(self, k: isize, x: __m256i) {
-        let (y, c) = (k * self.ys as isize, k * self.cs as isize);
-        store16(self.y.offset(y), _mm256_castsi256_si128(x));
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn store_row(&mut self, k: usize, c: __m256i) {
+        let x = self.left;
+        self.y.store(k, x, _mm256_castsi256_si128(c));
         store_uv(
-            _mm256_extracti128_si256::<1>(x),
-            self.u.offset(c),
-            self.v.offset(c),
+            _mm256_extracti128_si256::<1>(c),
+            &mut self.u,
+            &mut self.v,
+            k,
+            x,
         );
     }
+}
 
-    /// `sse2::load8x4` of 8 luma and 8 chroma rows.
-    #[inline(always)]
-    unsafe fn load8x4(l: *const u8, ls: usize, c: *const u8, cs: usize) -> (__m256i, __m256i) {
-        let a = |k: usize| {
-            _mm256_setr_epi32(
-                rd32(l.add(k * ls)),
-                rd32(l.add((k + 4) * ls)),
-                rd32(l.add((k + 2) * ls)),
-                rd32(l.add((k + 6) * ls)),
-                rd32(c.add(k * cs)),
-                rd32(c.add((k + 4) * cs)),
-                rd32(c.add((k + 2) * cs)),
-                rd32(c.add((k + 6) * cs)),
-            )
-        };
-        let (a0, a1) = (a(0), a(1));
-        let b0 = _mm256_unpacklo_epi8(a0, a1);
-        let b1 = _mm256_unpackhi_epi8(a0, a1);
-        let c0 = _mm256_unpacklo_epi16(b0, b1);
-        let c1 = _mm256_unpackhi_epi16(b0, b1);
-        (_mm256_unpacklo_epi32(c0, c1), _mm256_unpackhi_epi32(c0, c1))
-    }
+/// The transposition of `sse2::load8x4`, of 8 luma rows in the low lanes and 8 chroma rows in
+/// the high ones as `gather!` loads them.
+#[target_feature(enable = "avx2")]
+#[inline]
+fn transpose8x4(a0: __m256i, a1: __m256i) -> (__m256i, __m256i) {
+    let b0 = _mm256_unpacklo_epi8(a0, a1);
+    let b1 = _mm256_unpackhi_epi8(a0, a1);
+    let c0 = _mm256_unpacklo_epi16(b0, b1);
+    let c1 = _mm256_unpackhi_epi16(b0, b1);
+    (_mm256_unpacklo_epi32(c0, c1), _mm256_unpackhi_epi32(c0, c1))
+}
 
-    /// `sse2::load16x4`: columns 0..4 of the 16 luma rows and of the 8 rows of each chroma plane.
-    #[inline(always)]
-    unsafe fn columns(self) -> [__m256i; 4] {
-        let (t1, t2) = Self::load8x4(self.y, self.ys, self.u, self.cs);
-        let (p0, q1) = Self::load8x4(self.y.add(8 * self.ys), self.ys, self.v, self.cs);
+/// Rows `k`, `k + 4`, `k + 2` and `k + 6` of luma `l` and rows `j`, ... of chroma `c`, 4
+/// bytes each at byte `x`.
+macro_rules! gather {
+    ($l:expr, $k:expr, $c:expr, $j:expr, $x:expr) => {
+        _mm256_setr_epi32(
+            $l.load($k, $x),
+            $l.load($k + 4, $x),
+            $l.load($k + 2, $x),
+            $l.load($k + 6, $x),
+            $c.load($j, $x),
+            $c.load($j + 4, $x),
+            $c.load($j + 2, $x),
+            $c.load($j + 6, $x),
+        )
+    };
+}
+
+/// `sse2::load16x4` of `Planes` `m`: columns `x..x + 4` of the 16 luma rows and of the 8 rows
+/// of each chroma plane from row `k`. Macros, as the `#[inline(always)]` that a
+/// `#[target_feature]` function cannot have: as functions LLVM keeps them out of line.
+macro_rules! columns {
+    ($m:expr, $k:expr, $x:expr) => {{
+        let (k, x) = ($k, $x);
+        let (t1, t2) = transpose8x4(
+            gather!($m.y, k, $m.u, k, x),
+            gather!($m.y, k + 1, $m.u, k + 1, x),
+        );
+        let (p0, q1) = transpose8x4(
+            gather!($m.y, k + 8, $m.v, k, x),
+            gather!($m.y, k + 9, $m.v, k + 1, x),
+        );
         [
             _mm256_unpacklo_epi64(t1, p0),
             _mm256_unpackhi_epi64(t1, p0),
             _mm256_unpacklo_epi64(t2, q1),
             _mm256_unpackhi_epi64(t2, q1),
         ]
-    }
-
-    #[inline(always)]
-    unsafe fn store_columns(self, c: [__m256i; 4]) {
-        let [p1, p0, q0, q1] = c;
-        let p0_s = _mm256_unpacklo_epi8(p1, p0);
-        let p1_s = _mm256_unpackhi_epi8(p1, p0);
-        let q0_s = _mm256_unpacklo_epi8(q0, q1);
-        let q1_s = _mm256_unpackhi_epi8(q0, q1);
-        let (ys, cs) = (self.ys, self.cs);
-        for (x, l, c) in [
-            (_mm256_unpacklo_epi16(p0_s, q0_s), self.y, self.u),
-            (_mm256_unpackhi_epi16(p0_s, q0_s), self.y.add(4 * ys), self.u.add(4 * cs)),
-            (_mm256_unpacklo_epi16(p1_s, q1_s), self.y.add(8 * ys), self.v),
-            (_mm256_unpackhi_epi16(p1_s, q1_s), self.y.add(12 * ys), self.v.add(4 * cs)),
-        ] {
-            store4x4(_mm256_castsi256_si128(x), l, ys);
-            store4x4(_mm256_extracti128_si256::<1>(x), c, cs);
-        }
-    }
+    }};
 }
 
+/// `columns!` stored back.
+macro_rules! store_columns {
+    ($m:expr, $k:expr, $x:expr, $c:expr) => {{
+        let (k, x) = ($k, $x);
+        let [a, b, c, d] = columns_to_rows($c);
+        let lo = |v| _mm256_castsi256_si128(v);
+        let hi = |v| _mm256_extracti128_si256::<1>(v);
+        store4x4(lo(a), &mut $m.y, k, x);
+        store4x4(hi(a), &mut $m.u, k, x);
+        store4x4(lo(b), &mut $m.y, k + 4, x);
+        store4x4(hi(b), &mut $m.u, k + 4, x);
+        store4x4(lo(c), &mut $m.y, k + 8, x);
+        store4x4(hi(c), &mut $m.v, k, x);
+        store4x4(lo(d), &mut $m.y, k + 12, x);
+        store4x4(hi(d), &mut $m.v, k + 4, x);
+    }};
+}
+
+/// `sse2::columns_to_rows` on 256 bits.
+#[target_feature(enable = "avx2")]
+#[inline]
+fn columns_to_rows(c: [__m256i; 4]) -> [__m256i; 4] {
+    let [p1, p0, q0, q1] = c;
+    let p0_s = _mm256_unpacklo_epi8(p1, p0);
+    let p1_s = _mm256_unpackhi_epi8(p1, p0);
+    let q0_s = _mm256_unpacklo_epi8(q0, q1);
+    let q1_s = _mm256_unpackhi_epi8(q0, q1);
+    [
+        _mm256_unpacklo_epi16(p0_s, q0_s),
+        _mm256_unpackhi_epi16(p0_s, q0_s),
+        _mm256_unpacklo_epi16(p1_s, q1_s),
+        _mm256_unpackhi_epi16(p1_s, q1_s),
+    ]
+}
 /// libwebp's `DoFilter` for one macroblock with the normal filter, the luma filters (`VP8HFilter16`,
 /// `VP8HFilter16i`, `VP8VFilter16`, `VP8VFilter16i`) and the chroma ones (`VP8HFilter8`, ...) on
 /// the same edge in one 256-bit register: `py` and `puv` are the macroblock origins in the planes,
 /// `left`, `inner` and `top` the edges to filter. False, filtering nothing, without AVX2.
+#[allow(unsafe_code)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn filter_normal(
     y: &mut [u8],
@@ -424,99 +498,126 @@ pub(crate) fn filter_normal(
     if !crate::wide::has_avx2() {
         return false;
     }
-    let back = |stride: usize| if top { 4 * stride } else if left { 4 } else { 0 };
-    assert!(py >= back(ys) && py + 15 * ys + 16 <= y.len());
-    for c in [&*u, &*v] {
-        assert!(puv >= back(cs) && puv + 7 * cs + 8 <= c.len());
-    }
-    let planes = Planes {
-        y: y.as_mut_ptr(),
-        ys,
-        u: u.as_mut_ptr(),
-        v: v.as_mut_ptr(),
-        cs,
-    };
-    // SAFETY: the CPU has AVX2; the filters reach 4 rows above and 4 pixels left of the
-    // macroblocks where they filter those edges, and no further than their last row and column.
+    let args = (y, py, ys, u, v, puv, cs, inner, limit, ilevel, hev);
+    // SAFETY: the CPU has AVX2.
     unsafe {
-        filter_normal_avx2(
-            planes.at(py as isize, puv as isize),
-            [left, inner, top],
-            limit,
-            ilevel,
-            hev,
-        );
+        match (left, top) {
+            (true, true) => filter_normal_avx2::<20, 20, 12, 12>(args),
+            (true, false) => filter_normal_avx2::<16, 20, 8, 12>(args),
+            (false, true) => filter_normal_avx2::<20, 16, 12, 8>(args),
+            (false, false) => filter_normal_avx2::<16, 16, 8, 8>(args),
+        }
     }
     true
 }
 
+type FilterArgs<'a> = (
+    &'a mut [u8],
+    usize,
+    usize,
+    &'a mut [u8],
+    &'a mut [u8],
+    usize,
+    usize,
+    bool,
+    u8,
+    u8,
+    u8,
+);
+
+/// `filter_normal` of the `YN` luma rows of `YW` bytes and `CN` chroma rows of `CW` bytes its
+/// filters reach: 4 more of each when it filters the top and the left edge. So one bounds check
+/// per plane covers them all.
 #[target_feature(enable = "avx2")]
-unsafe fn filter_normal_avx2(m: Planes, [left, inner, top]: [bool; 3], limit: u8, ilevel: u8, hev: u8) {
-    let (ys, cs) = (m.ys as isize, m.cs as isize);
-    if left {
-        let b = m.at(-4, -4);
-        let [p3, mut p2, mut p1, mut p0] = b.columns();
+fn filter_normal_avx2<const YN: usize, const YW: usize, const CN: usize, const CW: usize>(
+    args: FilterArgs,
+) {
+    let (y, py, ys, u, v, puv, cs, inner, limit, ilevel, hev) = args;
+    let (up, left) = (YN - 16, YW - 16);
+    let mut m = Planes::<YN, YW, CN, CW> {
+        y: Rows::new(y, py - up * ys - left, ys),
+        u: Rows::new(u, puv - up * cs - left, cs),
+        v: Rows::new(v, puv - up * cs - left, cs),
+        left,
+    };
+    if left > 0 {
+        let [p3, mut p2, mut p1, mut p0] = columns!(m, up, 0);
         let mask = max_diff(abs_diff(p1, p0), p3, p2, p1, p0);
-        let [mut q0, mut q1, mut q2, q3] = m.columns();
+        let [mut q0, mut q1, mut q2, q3] = columns!(m, up, 4);
         let mask = max_diff(mask, q3, q2, q1, q0);
         let mask = complex_mask(p1, p0, q0, q1, limit + 4, ilevel, mask);
-        do_filter6(&mut p2, &mut p1, &mut p0, &mut q0, &mut q1, &mut q2, mask, hev);
-        b.store_columns([p3, p2, p1, p0]);
-        m.store_columns([q0, q1, q2, q3]);
+        do_filter6(
+            &mut p2, &mut p1, &mut p0, &mut q0, &mut q1, &mut q2, mask, hev,
+        );
+        store_columns!(m, up, 0, [p3, p2, p1, p0]);
+        store_columns!(m, up, 4, [q0, q1, q2, q3]);
     }
     if inner {
-        let luma = |b: Planes| load16x4(b.y, b.y.add(8 * b.ys), b.ys).map(|x| _mm256_castsi128_si256(x));
-        let [mut p3, mut p2, mut p1, mut p0] = m.columns();
-        let mut b = m;
+        let [mut p3, mut p2, mut p1, mut p0] = columns!(m, up, left);
         for k in 0..3 {
-            let d = b.at(2, 2);
-            b = b.at(4, 4);
+            let b = left + 4 * k + 4;
             let mask = max_diff(abs_diff(p1, p0), p3, p2, p1, p0);
-            let [n3, n2, tmp1, tmp2] = if k == 0 { b.columns() } else { luma(b) };
-            (p3, p2) = (n3, n2);
-            let mask = max_diff(mask, p3, p2, tmp1, tmp2);
-            let mask = complex_mask(p1, p0, p3, p2, limit, ilevel, mask);
-            do_filter4(&mut p1, &mut p0, &mut p3, &mut p2, mask, hev);
-            if k == 0 {
-                d.store_columns([p1, p0, p3, p2]);
+            let [n3, n2, tmp1, tmp2] = if k == 0 {
+                columns!(m, up, b)
             } else {
-                let c = [p1, p0, p3, p2].map(|x| _mm256_castsi256_si128(x));
-                store16x4(c, d.y, d.y.add(8 * m.ys), m.ys);
-            }
-            (p1, p0) = (tmp1, tmp2);
-        }
-    }
-    if top {
-        let (t1, mut p2, mut p1, mut p0) = (m.row(-4), m.row(-3), m.row(-2), m.row(-1));
-        let mask = max_diff(abs_diff(p1, p0), t1, p2, p1, p0);
-        let (mut q0, mut q1, mut q2, t1) = (m.row(0), m.row(1), m.row(2), m.row(3));
-        let mask = max_diff(mask, t1, q2, q1, q0);
-        let mask = complex_mask(p1, p0, q0, q1, limit + 4, ilevel, mask);
-        do_filter6(&mut p2, &mut p1, &mut p0, &mut q0, &mut q1, &mut q2, mask, hev);
-        for (k, x) in [(-3, p2), (-2, p1), (-1, p0), (0, q0), (1, q1), (2, q2)] {
-            m.store_row(k, x);
-        }
-    }
-    if inner {
-        let luma = |b: Planes, k: isize| _mm256_castsi128_si256(load16(b.y.offset(k * ys)));
-        let (mut p3, mut p2, mut p1, mut p0) = (m.row(0), m.row(1), m.row(2), m.row(3));
-        let mut b = m;
-        for k in 0..3 {
-            let d = b.at(2 * ys, 2 * cs);
-            b = b.at(4 * ys, 4 * cs);
-            let mask = max_diff(abs_diff(p1, p0), p3, p2, p1, p0);
-            let [n3, n2, tmp1, tmp2] = match k {
-                0 => [0, 1, 2, 3].map(|r| b.row(r)),
-                _ => [0, 1, 2, 3].map(|r| luma(b, r)),
+                let [a, b, c, d] = load16x4(&m.y, up, &m.y, up + 8, b);
+                let wide = |x| _mm256_castsi128_si256(x);
+                [wide(a), wide(b), wide(c), wide(d)]
             };
             (p3, p2) = (n3, n2);
             let mask = max_diff(mask, p3, p2, tmp1, tmp2);
             let mask = complex_mask(p1, p0, p3, p2, limit, ilevel, mask);
             do_filter4(&mut p1, &mut p0, &mut p3, &mut p2, mask, hev);
-            for (r, x) in [(0, p1), (1, p0), (2, p3), (3, p2)] {
+            if k == 0 {
+                store_columns!(m, up, b - 2, [p1, p0, p3, p2]);
+            } else {
+                let narrow = |x| _mm256_castsi256_si128(x);
+                let c = [narrow(p1), narrow(p0), narrow(p3), narrow(p2)];
+                store16x4(c, &mut m.y, up, b - 2);
+            }
+            (p1, p0) = (tmp1, tmp2);
+        }
+    }
+    if up > 0 {
+        let [t1, mut p2, mut p1, mut p0] = [m.row(0), m.row(1), m.row(2), m.row(3)];
+        let mask = max_diff(abs_diff(p1, p0), t1, p2, p1, p0);
+        let [mut q0, mut q1, mut q2, t1] = [m.row(4), m.row(5), m.row(6), m.row(7)];
+        let mask = max_diff(mask, t1, q2, q1, q0);
+        let mask = complex_mask(p1, p0, q0, q1, limit + 4, ilevel, mask);
+        do_filter6(
+            &mut p2, &mut p1, &mut p0, &mut q0, &mut q1, &mut q2, mask, hev,
+        );
+        for (k, x) in [p2, p1, p0, q0, q1, q2].into_iter().enumerate() {
+            m.store_row(k + 1, x);
+        }
+    }
+    if inner {
+        let [mut p3, mut p2, mut p1, mut p0] =
+            [m.row(up), m.row(up + 1), m.row(up + 2), m.row(up + 3)];
+        for k in 0..3 {
+            let b = up + 4 * k + 4;
+            let mask = max_diff(abs_diff(p1, p0), p3, p2, p1, p0);
+            let [n3, n2, tmp1, tmp2] = match k {
+                0 => [m.row(b), m.row(b + 1), m.row(b + 2), m.row(b + 3)],
+                _ => {
+                    let wide = |x| _mm256_castsi128_si256(x);
+                    let [a, c, d, e] = [
+                        m.y.load(b, left),
+                        m.y.load(b + 1, left),
+                        m.y.load(b + 2, left),
+                        m.y.load(b + 3, left),
+                    ];
+                    [wide(a), wide(c), wide(d), wide(e)]
+                }
+            };
+            (p3, p2) = (n3, n2);
+            let mask = max_diff(mask, p3, p2, tmp1, tmp2);
+            let mask = complex_mask(p1, p0, p3, p2, limit, ilevel, mask);
+            do_filter4(&mut p1, &mut p0, &mut p3, &mut p2, mask, hev);
+            for (r, x) in [p1, p0, p3, p2].into_iter().enumerate() {
                 match k {
-                    0 => d.store_row(r, x),
-                    _ => store16(d.y.offset(r * ys), _mm256_castsi256_si128(x)),
+                    0 => m.store_row(b - 2 + r, x),
+                    _ => m.y.store(b - 2 + r, left, _mm256_castsi256_si128(x)),
                 }
             }
             (p1, p0) = (tmp1, tmp2);
@@ -525,6 +626,7 @@ unsafe fn filter_normal_avx2(m: Planes, [left, inner, top]: [bool; 3], limit: u8
 }
 
 #[cfg(test)]
+#[allow(unsafe_code)]
 mod tests {
     use rand::{Rng, SeedableRng};
 
@@ -548,9 +650,12 @@ mod tests {
                 };
                 let step = if bpp == 3 { 64 } else { 16 };
                 assert_eq!(done, len / step * step);
-                match bpp {
-                    3 => super::super::sse2::yuv_to_rgb_row_from::<3>(&y, &u, &v, &mut b, 0),
-                    _ => super::super::sse2::yuv_to_rgb_row_from::<4>(&y, &u, &v, &mut b, 0),
+                // SAFETY: SSE2 is part of x86_64.
+                unsafe {
+                    match bpp {
+                        3 => super::super::sse2::yuv_to_rgb_row_from::<3>(&y, &u, &v, &mut b, 0),
+                        _ => super::super::sse2::yuv_to_rgb_row_from::<4>(&y, &u, &v, &mut b, 0),
+                    }
                 };
                 assert_eq!(a[..done * bpp], b[..done * bpp], "bpp {bpp} len {len}");
             }
@@ -566,14 +671,21 @@ mod tests {
         for round in 0usize..600 {
             let width = 1 + round % 300;
             let n = width.div_ceil(2);
-            let mut sample = || if round % 3 == 0 { rng.gen_range(0..2) * 255 } else { rng.gen() };
+            let mut sample = || {
+                if round % 3 == 0 {
+                    rng.gen_range(0..2) * 255
+                } else {
+                    rng.gen()
+                }
+            };
             let near: Vec<u8> = (0..n).map(|_| sample()).collect();
             let far: Vec<u8> = (0..n).map(|_| sample()).collect();
             let mut a = vec![0u8; width];
             let mut b = vec![0u8; width];
             // SAFETY: the CPU has AVX2.
             let done = unsafe { super::upsample_pairs(&near, &far, &mut a) };
-            super::super::sse2::upsample_pairs_from(&near, &far, &mut b, 0);
+            // SAFETY: SSE2 is part of x86_64.
+            unsafe { super::super::sse2::upsample_pairs_from(&near, &far, &mut b, 0) };
             assert_eq!(a[1..1 + 2 * done], b[1..1 + 2 * done], "{width}");
         }
     }
@@ -589,12 +701,17 @@ mod tests {
         let mut changed = 0;
         for round in 0..2000 {
             let flags = [round & 1 != 0, round & 2 != 0, round & 4 != 0];
-            let (level, interior, hev) = (rng.gen_range(1..64u8), rng.gen_range(1..10u8), rng.gen_range(0..3));
+            let (level, interior, hev) = (
+                rng.gen_range(1..64u8),
+                rng.gen_range(1..10u8),
+                rng.gen_range(0..3),
+            );
             let limit = 2 * level + interior;
             let spread = [3, 10, 30, 127][round / 8 % 4];
             let mut plane = |w: usize, h: usize| {
-                let base: Vec<i32> =
-                    (0..w * h / 16).map(|_| 128 + rng.gen_range(-spread..=spread)).collect();
+                let base: Vec<i32> = (0..w * h / 16)
+                    .map(|_| 128 + rng.gen_range(-spread..=spread))
+                    .collect();
                 (0..w * h)
                     .map(|i| {
                         let b = base[(i / w / 4) * (w / 4) + i % w / 4];
@@ -631,5 +748,4 @@ mod tests {
         }
         assert!(changed > 1000, "{changed} rounds filtered");
     }
-
 }
