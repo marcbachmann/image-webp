@@ -1,31 +1,29 @@
 //! SSE2 kernels ported from libwebp's `dsp/enc_sse2.c`, bit-exact with the scalar ones.
 //! SSE2 is part of x86_64, so no runtime detection is needed. Each wrapper checks the
 //! lengths its loads and stores rely on.
-#![allow(unsafe_code)]
 
 use core::arch::x86_64::*;
 
 use super::dsp::{Matrix, BPS, MAX_LEVEL, QFIX};
+use crate::simd_mem::{load, load_at, store, store_at, Pod};
 
-#[inline(always)]
-unsafe fn loadl(p: &[u8], off: usize) -> __m128i {
-    _mm_loadl_epi64(p.as_ptr().add(off).cast())
+#[target_feature(enable = "sse2")]
+#[inline]
+fn loadl(p: &[u8], off: usize) -> __m128i {
+    _mm_cvtsi64_si128(load_at(p, off))
 }
 
-#[inline(always)]
-unsafe fn load_i16x8(p: &[i16], off: usize) -> __m128i {
-    _mm_loadu_si128(p.as_ptr().add(off).cast())
-}
-
-#[inline(always)]
-unsafe fn hsum(v: __m128i) -> i32 {
+#[target_feature(enable = "sse2")]
+#[inline]
+fn hsum(v: __m128i) -> i32 {
     let mut tmp = [0i32; 4];
-    _mm_storeu_si128(tmp.as_mut_ptr().cast(), v);
+    store(&mut tmp, v);
     tmp[3] + tmp[2] + tmp[1] + tmp[0]
 }
 
-#[inline(always)]
-unsafe fn transpose_2_4x4(i0: __m128i, i1: __m128i, i2: __m128i, i3: __m128i) -> [__m128i; 4] {
+#[target_feature(enable = "sse2")]
+#[inline]
+fn transpose_2_4x4(i0: __m128i, i1: __m128i, i2: __m128i, i3: __m128i) -> [__m128i; 4] {
     let t0_0 = _mm_unpacklo_epi16(i0, i1);
     let t0_1 = _mm_unpacklo_epi16(i2, i3);
     let t0_2 = _mm_unpackhi_epi16(i0, i1);
@@ -42,18 +40,31 @@ unsafe fn transpose_2_4x4(i0: __m128i, i1: __m128i, i2: __m128i, i3: __m128i) ->
     ]
 }
 
-/// One inverse transform of `input` (16 coefficients) added to the 4x4 block `r`.
+#[target_feature(enable = "sse2")]
 #[inline]
+fn load_pair<T: Pod>(p: &[T]) -> [__m128i; 2] {
+    let p = &p[..16];
+    [load(p), load_at(p, 8)]
+}
+
+/// One inverse transform of `input` (16 coefficients) added to the 4x4 block `r`.
+#[allow(unsafe_code)]
+#[inline(always)]
 pub(crate) fn itransform_one(r: &[u8], input: &[i16], dst: &mut [u8]) {
-    let input = &input[..16];
-    unsafe {
-        itransform_one_rows(r, [load_i16x8(input, 0), load_i16x8(input, 8)], dst);
-    }
+    // SAFETY: SSE2 is part of x86_64.
+    unsafe { itransform_one_sse2(r, input, dst) }
+}
+
+#[target_feature(enable = "sse2")]
+#[inline]
+fn itransform_one_sse2(r: &[u8], input: &[i16], dst: &mut [u8]) {
+    itransform_one_rows(r, load_pair(input), dst);
 }
 
 /// `itransform_one`, then the squared error of the result against the 4x4 block `src` and,
 /// with `w`, `ttransform(src, result, w)`.
-#[inline]
+#[allow(unsafe_code)]
+#[inline(always)]
 pub(crate) fn itransform_one_disto(
     r: &[u8],
     input: &[i16],
@@ -61,17 +72,28 @@ pub(crate) fn itransform_one_disto(
     src: &[u8],
     w: Option<&[u16; 16]>,
 ) -> (i32, i32) {
-    let input = &input[..16];
-    unsafe {
-        let out = itransform_one_rows(r, [load_i16x8(input, 0), load_i16x8(input, 8)], dst);
-        disto4x4(out, src, w)
-    }
+    // SAFETY: SSE2 is part of x86_64.
+    unsafe { itransform_one_disto_sse2(r, input, dst, src, w) }
+}
+
+#[target_feature(enable = "sse2")]
+#[inline]
+fn itransform_one_disto_sse2(
+    r: &[u8],
+    input: &[i16],
+    dst: &mut [u8],
+    src: &[u8],
+    w: Option<&[u16; 16]>,
+) -> (i32, i32) {
+    let out = itransform_one_rows(r, load_pair(input), dst);
+    disto4x4(out, src, w)
 }
 
 /// One 4x4 block of the 4x4 mode search: the forward transform of `src - r` quantized with
 /// `mtx` into `levels`, and its reconstruction into `dst`. Returns a bit for each non-zero
 /// level and the `itransform_one_disto` metrics.
-#[inline]
+#[allow(unsafe_code)]
+#[inline(always)]
 pub(crate) fn reconstruct4x4_disto(
     src: &[u8],
     r: &[u8],
@@ -80,31 +102,45 @@ pub(crate) fn reconstruct4x4_disto(
     dst: &mut [u8],
     w: Option<&[u16; 16]>,
 ) -> (u32, i32, i32) {
-    unsafe {
-        let (dequant, non_zero) = quantize_regs(ftransform_regs(src, r), levels, mtx);
-        let swapped = ((non_zero >> 3) ^ (non_zero >> 12)) & 1;
-        let out = itransform_one_rows(r, dequant, dst);
-        let (sse, disto) = disto4x4(out, src, w);
-        (non_zero ^ (swapped << 3 | swapped << 12), sse, disto)
-    }
+    // SAFETY: SSE2 is part of x86_64.
+    unsafe { reconstruct4x4_disto_sse2(src, r, mtx, levels, dst, w) }
+}
+
+#[target_feature(enable = "sse2")]
+#[inline]
+fn reconstruct4x4_disto_sse2(
+    src: &[u8],
+    r: &[u8],
+    mtx: &Matrix,
+    levels: &mut [i16; 16],
+    dst: &mut [u8],
+    w: Option<&[u16; 16]>,
+) -> (u32, i32, i32) {
+    let (dequant, non_zero) = quantize_regs(ftransform_regs(src, r), levels, mtx);
+    let swapped = ((non_zero >> 3) ^ (non_zero >> 12)) & 1;
+    let out = itransform_one_rows(r, dequant, dst);
+    let (sse, disto) = disto4x4(out, src, w);
+    (non_zero ^ (swapped << 3 | swapped << 12), sse, disto)
 }
 
 /// The squared error of the packed 4x4 block `out` against `src` and, with `w`,
 /// `|ttransform(src, out, w)| >> 5`.
-#[inline(always)]
-unsafe fn disto4x4(out: __m128i, src: &[u8], w: Option<&[u16; 16]>) -> (i32, i32) {
+#[target_feature(enable = "sse2")]
+#[inline]
+fn disto4x4(out: __m128i, src: &[u8], w: Option<&[u16; 16]>) -> (i32, i32) {
     let src = &src[..3 * BPS + 4];
     let zero = _mm_setzero_si128();
-    let ld32 = |off: usize| {
-        _mm_cvtsi32_si128(i32::from_le_bytes(src[off..off + 4].try_into().unwrap()))
-    };
+    let ld32 = |off: usize| _mm_cvtsi32_si128(load_at(src, off));
     let s01 = _mm_unpacklo_epi8(_mm_unpacklo_epi32(ld32(0), ld32(BPS)), zero);
     let s23 = _mm_unpacklo_epi8(_mm_unpacklo_epi32(ld32(2 * BPS), ld32(3 * BPS)), zero);
     let o01 = _mm_unpacklo_epi8(out, zero);
     let o23 = _mm_unpackhi_epi8(out, zero);
     let d01 = _mm_sub_epi16(s01, o01);
     let d23 = _mm_sub_epi16(s23, o23);
-    let sse = hsum(_mm_add_epi32(_mm_madd_epi16(d01, d01), _mm_madd_epi16(d23, d23)));
+    let sse = hsum(_mm_add_epi32(
+        _mm_madd_epi16(d01, d01),
+        _mm_madd_epi16(d23, d23),
+    ));
     let disto = w.map_or(0, |w| {
         ttransform_rows(
             [
@@ -120,8 +156,9 @@ unsafe fn disto4x4(out: __m128i, src: &[u8], w: Option<&[u16; 16]>) -> (i32, i32
 }
 
 /// The inverse transform into `dst`, returning its four rows packed.
-#[inline(always)]
-unsafe fn itransform_one_rows(r: &[u8], [in01, in23]: [__m128i; 2], dst: &mut [u8]) -> __m128i {
+#[target_feature(enable = "sse2")]
+#[inline]
+fn itransform_one_rows(r: &[u8], [in01, in23]: [__m128i; 2], dst: &mut [u8]) -> __m128i {
     let r = &r[..3 * BPS + 4];
     let dst = &mut dst[..3 * BPS + 4];
     let k1k2 = _mm_set_epi16(-30068, -30068, -30068, -30068, 20091, 20091, 20091, 20091);
@@ -159,8 +196,7 @@ unsafe fn itransform_one_rows(r: &[u8], [in01, in23]: [__m128i; 2], dst: &mut [u
     let (t01, t23) = pass(in01, in23, zero, false);
     let (t01, t23) = pass(t01, t23, zero_four, true);
 
-    let ld32 =
-        |off: usize| _mm_cvtsi32_si128(i32::from_le_bytes(r[off..off + 4].try_into().unwrap()));
+    let ld32 = |off: usize| _mm_cvtsi32_si128(load_at(r, off));
     let ref01 = _mm_unpacklo_epi8(_mm_unpacklo_epi32(ld32(0), ld32(BPS)), zero);
     let ref23 = _mm_unpacklo_epi8(_mm_unpacklo_epi32(ld32(2 * BPS), ld32(3 * BPS)), zero);
     let out = _mm_packus_epi16(_mm_add_epi16(ref01, t01), _mm_add_epi16(ref23, t23));
@@ -171,69 +207,73 @@ unsafe fn itransform_one_rows(r: &[u8], [in01, in23]: [__m128i; 2], dst: &mut [u
         _mm_srli_si128::<12>(out),
     ];
     for (y, row) in rows.into_iter().enumerate() {
-        dst[y * BPS..y * BPS + 4].copy_from_slice(&_mm_cvtsi128_si32(row).to_le_bytes());
+        store_at(dst, y * BPS, _mm_cvtsi128_si32(row));
     }
     out
 }
 
 /// Two inverse transforms of `input` (32 coefficients) for side-by-side 4x4 blocks.
-#[inline]
+#[allow(unsafe_code)]
+#[inline(always)]
 pub(crate) fn itransform_two(r: &[u8], input: &[i16], dst: &mut [u8]) {
+    // SAFETY: SSE2 is part of x86_64.
+    unsafe { itransform_two_sse2(r, input, dst) }
+}
+
+#[target_feature(enable = "sse2")]
+#[inline]
+fn itransform_two_sse2(r: &[u8], input: &[i16], dst: &mut [u8]) {
     let input = &input[..32];
     let r = &r[..3 * BPS + 8];
     let dst = &mut dst[..3 * BPS + 8];
-    unsafe {
-        let k1 = _mm_set1_epi16(20091);
-        let k2 = _mm_set1_epi16(-30068);
-        let tmp0 = load_i16x8(input, 0);
-        let tmp1 = load_i16x8(input, 8);
-        let tmp2 = load_i16x8(input, 16);
-        let tmp3 = load_i16x8(input, 24);
-        let in0 = _mm_unpacklo_epi64(tmp0, tmp2);
-        let in1 = _mm_unpackhi_epi64(tmp0, tmp2);
-        let in2 = _mm_unpacklo_epi64(tmp1, tmp3);
-        let in3 = _mm_unpackhi_epi64(tmp1, tmp3);
+    let k1 = _mm_set1_epi16(20091);
+    let k2 = _mm_set1_epi16(-30068);
+    let [tmp0, tmp1] = load_pair(input);
+    let [tmp2, tmp3] = load_pair(&input[16..]);
+    let in0 = _mm_unpacklo_epi64(tmp0, tmp2);
+    let in1 = _mm_unpackhi_epi64(tmp0, tmp2);
+    let in2 = _mm_unpacklo_epi64(tmp1, tmp3);
+    let in3 = _mm_unpackhi_epi64(tmp1, tmp3);
 
-        let pass =
-            |x0: __m128i, x1: __m128i, x2: __m128i, x3: __m128i, dc_add: i16, shift: bool| {
-                let dc = _mm_add_epi16(x0, _mm_set1_epi16(dc_add));
-                let a = _mm_add_epi16(dc, x2);
-                let b = _mm_sub_epi16(dc, x2);
-                let c = _mm_add_epi16(
-                    _mm_sub_epi16(x1, x3),
-                    _mm_sub_epi16(_mm_mulhi_epi16(x1, k2), _mm_mulhi_epi16(x3, k1)),
-                );
-                let d = _mm_add_epi16(
-                    _mm_add_epi16(x1, x3),
-                    _mm_add_epi16(_mm_mulhi_epi16(x1, k1), _mm_mulhi_epi16(x3, k2)),
-                );
-                let mut t = [
-                    _mm_add_epi16(a, d),
-                    _mm_add_epi16(b, c),
-                    _mm_sub_epi16(b, c),
-                    _mm_sub_epi16(a, d),
-                ];
-                if shift {
-                    for v in &mut t {
-                        *v = _mm_srai_epi16::<3>(*v);
-                    }
-                }
-                transpose_2_4x4(t[0], t[1], t[2], t[3])
-            };
-        let t = pass(in0, in1, in2, in3, 0, false);
-        let t = pass(t[0], t[1], t[2], t[3], 4, true);
-
-        let zero = _mm_setzero_si128();
-        for (y, ty) in t.iter().enumerate() {
-            let row = _mm_unpacklo_epi8(loadl(r, y * BPS), zero);
-            let px = _mm_packus_epi16(_mm_add_epi16(row, *ty), _mm_add_epi16(row, *ty));
-            _mm_storel_epi64(dst.as_mut_ptr().add(y * BPS).cast(), px);
+    let pass = |x0: __m128i, x1: __m128i, x2: __m128i, x3: __m128i, dc_add: i16, shift: bool| {
+        let dc = _mm_add_epi16(x0, _mm_set1_epi16(dc_add));
+        let a = _mm_add_epi16(dc, x2);
+        let b = _mm_sub_epi16(dc, x2);
+        let c = _mm_add_epi16(
+            _mm_sub_epi16(x1, x3),
+            _mm_sub_epi16(_mm_mulhi_epi16(x1, k2), _mm_mulhi_epi16(x3, k1)),
+        );
+        let d = _mm_add_epi16(
+            _mm_add_epi16(x1, x3),
+            _mm_add_epi16(_mm_mulhi_epi16(x1, k1), _mm_mulhi_epi16(x3, k2)),
+        );
+        let mut t = [
+            _mm_add_epi16(a, d),
+            _mm_add_epi16(b, c),
+            _mm_sub_epi16(b, c),
+            _mm_sub_epi16(a, d),
+        ];
+        if shift {
+            for v in &mut t {
+                *v = _mm_srai_epi16::<3>(*v);
+            }
         }
+        transpose_2_4x4(t[0], t[1], t[2], t[3])
+    };
+    let t = pass(in0, in1, in2, in3, 0, false);
+    let t = pass(t[0], t[1], t[2], t[3], 4, true);
+
+    let zero = _mm_setzero_si128();
+    for (y, ty) in t.iter().enumerate() {
+        let row = _mm_unpacklo_epi8(loadl(r, y * BPS), zero);
+        let px = _mm_packus_epi16(_mm_add_epi16(row, *ty), _mm_add_epi16(row, *ty));
+        store_at(dst, y * BPS, _mm_cvtsi128_si64(px));
     }
 }
 
-#[inline(always)]
-unsafe fn ftransform_pass1(in01: __m128i, in23: __m128i) -> (__m128i, __m128i) {
+#[target_feature(enable = "sse2")]
+#[inline]
+fn ftransform_pass1(in01: __m128i, in23: __m128i) -> (__m128i, __m128i) {
     let k937 = _mm_set1_epi32(937);
     let k1812 = _mm_set1_epi32(1812);
     let k88p = _mm_set_epi16(8, 8, 8, 8, 8, 8, 8, 8);
@@ -261,8 +301,9 @@ unsafe fn ftransform_pass1(in01: __m128i, in23: __m128i) -> (__m128i, __m128i) {
     )
 }
 
-#[inline(always)]
-unsafe fn ftransform_pass2(v01: __m128i, v32: __m128i) -> [__m128i; 2] {
+#[target_feature(enable = "sse2")]
+#[inline]
+fn ftransform_pass2(v01: __m128i, v32: __m128i) -> [__m128i; 2] {
     let zero = _mm_setzero_si128();
     let seven = _mm_set1_epi16(7);
     let k5352_2217 = _mm_set_epi16(5352, 2217, 5352, 2217, 5352, 2217, 5352, 2217);
@@ -288,20 +329,30 @@ unsafe fn ftransform_pass2(v01: __m128i, v32: __m128i) -> [__m128i; 2] {
     [_mm_unpacklo_epi64(d0, g1), _mm_unpacklo_epi64(d2, f3)]
 }
 
-#[inline(always)]
-unsafe fn store_i16x16(out: &mut [i16], [lo, hi]: [__m128i; 2]) {
-    let out = &mut out[..16];
-    _mm_storeu_si128(out.as_mut_ptr().cast(), lo);
-    _mm_storeu_si128(out.as_mut_ptr().add(8).cast(), hi);
-}
-
+#[target_feature(enable = "sse2")]
 #[inline]
-pub(crate) fn ftransform(src: &[u8], r: &[u8], out: &mut [i16]) {
-    unsafe { store_i16x16(out, ftransform_regs(src, r)) }
+fn store_i16x16(out: &mut [i16], [lo, hi]: [__m128i; 2]) {
+    let out = &mut out[..16];
+    store(out, lo);
+    store_at(out, 8, hi);
 }
 
+#[allow(unsafe_code)]
 #[inline(always)]
-unsafe fn ftransform_regs(src: &[u8], r: &[u8]) -> [__m128i; 2] {
+pub(crate) fn ftransform(src: &[u8], r: &[u8], out: &mut [i16]) {
+    // SAFETY: SSE2 is part of x86_64.
+    unsafe { ftransform_sse2(src, r, out) }
+}
+
+#[target_feature(enable = "sse2")]
+#[inline]
+fn ftransform_sse2(src: &[u8], r: &[u8], out: &mut [i16]) {
+    store_i16x16(out, ftransform_regs(src, r))
+}
+
+#[target_feature(enable = "sse2")]
+#[inline]
+fn ftransform_regs(src: &[u8], r: &[u8]) -> [__m128i; 2] {
     let src = &src[..3 * BPS + 8];
     let r = &r[..3 * BPS + 8];
     let zero = _mm_setzero_si128();
@@ -321,30 +372,37 @@ unsafe fn ftransform_regs(src: &[u8], r: &[u8]) -> [__m128i; 2] {
     ftransform_pass2(v01, v32)
 }
 
-#[inline]
+#[allow(unsafe_code)]
+#[inline(always)]
 pub(crate) fn ftransform2(src: &[u8], r: &[u8], out: &mut [i16]) {
+    // SAFETY: SSE2 is part of x86_64.
+    unsafe { ftransform2_sse2(src, r, out) }
+}
+
+#[target_feature(enable = "sse2")]
+#[inline]
+fn ftransform2_sse2(src: &[u8], r: &[u8], out: &mut [i16]) {
     let src = &src[..3 * BPS + 8];
     let r = &r[..3 * BPS + 8];
     let out = &mut out[..32];
-    unsafe {
-        let zero = _mm_setzero_si128();
-        let diff = |y: usize| {
-            _mm_sub_epi16(
-                _mm_unpacklo_epi8(loadl(src, y * BPS), zero),
-                _mm_unpacklo_epi8(loadl(r, y * BPS), zero),
-            )
-        };
-        let (d0, d1, d2, d3) = (diff(0), diff(1), diff(2), diff(3));
-        let (v01l, v32l) = ftransform_pass1(_mm_unpacklo_epi32(d0, d1), _mm_unpacklo_epi32(d2, d3));
-        let (v01h, v32h) = ftransform_pass1(_mm_unpackhi_epi32(d0, d1), _mm_unpackhi_epi32(d2, d3));
-        let (lo, hi) = out.split_at_mut(16);
-        store_i16x16(lo, ftransform_pass2(v01l, v32l));
-        store_i16x16(hi, ftransform_pass2(v01h, v32h));
-    }
+    let zero = _mm_setzero_si128();
+    let diff = |y: usize| {
+        _mm_sub_epi16(
+            _mm_unpacklo_epi8(loadl(src, y * BPS), zero),
+            _mm_unpacklo_epi8(loadl(r, y * BPS), zero),
+        )
+    };
+    let (d0, d1, d2, d3) = (diff(0), diff(1), diff(2), diff(3));
+    let (v01l, v32l) = ftransform_pass1(_mm_unpacklo_epi32(d0, d1), _mm_unpacklo_epi32(d2, d3));
+    let (v01h, v32h) = ftransform_pass1(_mm_unpackhi_epi32(d0, d1), _mm_unpackhi_epi32(d2, d3));
+    let (lo, hi) = out.split_at_mut(16);
+    store_i16x16(lo, ftransform_pass2(v01l, v32l));
+    store_i16x16(hi, ftransform_pass2(v01h, v32h));
 }
 
-#[inline(always)]
-unsafe fn subtract_and_accumulate(a: __m128i, b: __m128i) -> __m128i {
+#[target_feature(enable = "sse2")]
+#[inline]
+fn subtract_and_accumulate(a: __m128i, b: __m128i) -> __m128i {
     let abs_a_b = _mm_or_si128(_mm_subs_epu8(a, b), _mm_subs_epu8(b, a));
     let zero = _mm_setzero_si128();
     let c0 = _mm_unpacklo_epi8(abs_a_b, zero);
@@ -352,66 +410,85 @@ unsafe fn subtract_and_accumulate(a: __m128i, b: __m128i) -> __m128i {
     _mm_add_epi32(_mm_madd_epi16(c0, c0), _mm_madd_epi16(c1, c1))
 }
 
-#[inline]
+#[allow(unsafe_code)]
+#[inline(always)]
 pub(crate) fn sse16xn(a: &[u8], b: &[u8], rows: usize) -> i32 {
-    let a = &a[..(rows - 1) * BPS + 16];
-    let b = &b[..(rows - 1) * BPS + 16];
-    unsafe {
-        let mut sum = _mm_setzero_si128();
-        for y in 0..rows {
-            let va = _mm_loadu_si128(a.as_ptr().add(y * BPS).cast());
-            let vb = _mm_loadu_si128(b.as_ptr().add(y * BPS).cast());
-            sum = _mm_add_epi32(sum, subtract_and_accumulate(va, vb));
-        }
-        hsum(sum)
-    }
+    // SAFETY: SSE2 is part of x86_64.
+    unsafe { sse16xn_sse2(a, b, rows) }
 }
 
+#[target_feature(enable = "sse2")]
 #[inline]
+fn sse16xn_sse2(a: &[u8], b: &[u8], rows: usize) -> i32 {
+    let a = &a[..(rows - 1) * BPS + 16];
+    let b = &b[..(rows - 1) * BPS + 16];
+    let mut sum = _mm_setzero_si128();
+    for y in 0..rows {
+        let va = load_at(a, y * BPS);
+        let vb = load_at(b, y * BPS);
+        sum = _mm_add_epi32(sum, subtract_and_accumulate(va, vb));
+    }
+    hsum(sum)
+}
+
+#[allow(unsafe_code)]
+#[inline(always)]
 pub(crate) fn sse4x4(a: &[u8], b: &[u8]) -> i32 {
+    // SAFETY: SSE2 is part of x86_64.
+    unsafe { sse4x4_sse2(a, b) }
+}
+
+#[target_feature(enable = "sse2")]
+#[inline]
+fn sse4x4_sse2(a: &[u8], b: &[u8]) -> i32 {
     let a = &a[..3 * BPS + 8];
     let b = &b[..3 * BPS + 8];
-    unsafe {
-        let zero = _mm_setzero_si128();
-        let a01 = _mm_unpacklo_epi8(_mm_unpacklo_epi32(loadl(a, 0), loadl(a, BPS)), zero);
-        let a23 = _mm_unpacklo_epi8(
-            _mm_unpacklo_epi32(loadl(a, 2 * BPS), loadl(a, 3 * BPS)),
-            zero,
-        );
-        let b01 = _mm_unpacklo_epi8(_mm_unpacklo_epi32(loadl(b, 0), loadl(b, BPS)), zero);
-        let b23 = _mm_unpacklo_epi8(
-            _mm_unpacklo_epi32(loadl(b, 2 * BPS), loadl(b, 3 * BPS)),
-            zero,
-        );
-        let d0 = _mm_subs_epi16(a01, b01);
-        let d1 = _mm_subs_epi16(a23, b23);
-        hsum(_mm_add_epi32(
-            _mm_madd_epi16(d0, d0),
-            _mm_madd_epi16(d1, d1),
-        ))
-    }
+    let zero = _mm_setzero_si128();
+    let a01 = _mm_unpacklo_epi8(_mm_unpacklo_epi32(loadl(a, 0), loadl(a, BPS)), zero);
+    let a23 = _mm_unpacklo_epi8(
+        _mm_unpacklo_epi32(loadl(a, 2 * BPS), loadl(a, 3 * BPS)),
+        zero,
+    );
+    let b01 = _mm_unpacklo_epi8(_mm_unpacklo_epi32(loadl(b, 0), loadl(b, BPS)), zero);
+    let b23 = _mm_unpacklo_epi8(
+        _mm_unpacklo_epi32(loadl(b, 2 * BPS), loadl(b, 3 * BPS)),
+        zero,
+    );
+    let d0 = _mm_subs_epi16(a01, b01);
+    let d1 = _mm_subs_epi16(a23, b23);
+    hsum(_mm_add_epi32(
+        _mm_madd_epi16(d0, d0),
+        _mm_madd_epi16(d1, d1),
+    ))
 }
 
 /// Weighted sum of the Hadamard coefficients of `a` minus that of `b`.
-#[inline]
+#[allow(unsafe_code)]
+#[inline(always)]
 pub(crate) fn ttransform(a: &[u8], b: &[u8], w: &[u16; 16]) -> i32 {
+    // SAFETY: SSE2 is part of x86_64.
+    unsafe { ttransform_sse2(a, b, w) }
+}
+
+#[target_feature(enable = "sse2")]
+#[inline]
+fn ttransform_sse2(a: &[u8], b: &[u8], w: &[u16; 16]) -> i32 {
     let a = &a[..3 * BPS + 8];
     let b = &b[..3 * BPS + 8];
-    unsafe {
-        let zero = _mm_setzero_si128();
-        let ld = |y: usize| {
-            _mm_unpacklo_epi8(
-                _mm_unpacklo_epi32(loadl(a, y * BPS), loadl(b, y * BPS)),
-                zero,
-            )
-        };
-        ttransform_rows([ld(0), ld(1), ld(2), ld(3)], w)
-    }
+    let zero = _mm_setzero_si128();
+    let ld = |y: usize| {
+        _mm_unpacklo_epi8(
+            _mm_unpacklo_epi32(loadl(a, y * BPS), loadl(b, y * BPS)),
+            zero,
+        )
+    };
+    ttransform_rows([ld(0), ld(1), ld(2), ld(3)], w)
 }
 
 /// `ttransform` of rows holding the 16-bit pixels of row `y` of `a` then of `b`.
-#[inline(always)]
-unsafe fn ttransform_rows([t0, t1, t2, t3]: [__m128i; 4], w: &[u16; 16]) -> i32 {
+#[target_feature(enable = "sse2")]
+#[inline]
+fn ttransform_rows([t0, t1, t2, t3]: [__m128i; 4], w: &[u16; 16]) -> i32 {
     let zero = _mm_setzero_si128();
     let butterfly = |t0: __m128i, t1: __m128i, t2: __m128i, t3: __m128i| {
         let a0 = _mm_add_epi16(t0, t2);
@@ -428,8 +505,7 @@ unsafe fn ttransform_rows([t0, t1, t2, t3]: [__m128i; 4], w: &[u16; 16]) -> i32 
     let b4 = butterfly(t0, t1, t2, t3);
     let t = transpose_2_4x4(b4[0], b4[1], b4[2], b4[3]);
     let b4 = butterfly(t[0], t[1], t[2], t[3]);
-    let w_0 = _mm_loadu_si128(w.as_ptr().cast());
-    let w_8 = _mm_loadu_si128(w.as_ptr().add(8).cast());
+    let [w_0, w_8] = load_pair(w);
     let abs = |v: __m128i| _mm_max_epi16(v, _mm_sub_epi16(zero, v));
     let a_b0 = abs(_mm_unpacklo_epi64(b4[0], b4[1]));
     let a_b2 = abs(_mm_unpacklo_epi64(b4[2], b4[3]));
@@ -440,54 +516,45 @@ unsafe fn ttransform_rows([t0, t1, t2, t3]: [__m128i; 4], w: &[u16; 16]) -> i32 
     hsum(_mm_sub_epi32(sa, sb))
 }
 
-#[inline]
+#[allow(unsafe_code)]
+#[inline(always)]
 pub(crate) fn quantize_block(input: &mut [i16], out: &mut [i16], mtx: &Matrix) -> bool {
-    let input = &mut input[..16];
-    unsafe {
-        let (dequant, non_zero) =
-            quantize_regs([load_i16x8(input, 0), load_i16x8(input, 8)], out, mtx);
-        store_i16x16(input, dequant);
-        non_zero != 0
-    }
+    // SAFETY: SSE2 is part of x86_64.
+    unsafe { quantize_block_sse2(input, out, mtx) }
+}
+
+#[target_feature(enable = "sse2")]
+#[inline]
+fn quantize_block_sse2(input: &mut [i16], out: &mut [i16], mtx: &Matrix) -> bool {
+    let (dequant, non_zero) = quantize_regs(load_pair(input), out, mtx);
+    store_i16x16(input, dequant);
+    non_zero != 0
 }
 
 /// `quantize_block` of coefficients in registers, returning the dequantized ones and a bit
 /// for each non-zero level, with those of levels 3 and 12 swapped.
-#[inline(always)]
-unsafe fn quantize_regs(
-    [in0, in8]: [__m128i; 2],
-    out: &mut [i16],
-    mtx: &Matrix,
-) -> ([__m128i; 2], u32) {
+#[target_feature(enable = "sse2")]
+#[inline]
+fn quantize_regs([in0, in8]: [__m128i; 2], out: &mut [i16], mtx: &Matrix) -> ([__m128i; 2], u32) {
     let out = &mut out[..16];
     let max_coeff_2047 = _mm_set1_epi16(MAX_LEVEL as i16);
     let zero = _mm_setzero_si128();
-    let iq0 = _mm_loadu_si128(mtx.iq.as_ptr().cast());
-    let iq8 = _mm_loadu_si128(mtx.iq.as_ptr().add(8).cast());
-    let q0 = _mm_loadu_si128(mtx.q.as_ptr().cast());
-    let q8 = _mm_loadu_si128(mtx.q.as_ptr().add(8).cast());
+    let [iq0, iq8] = load_pair(&mtx.iq);
+    let [q0, q8] = load_pair(&mtx.q);
+    let [sharpen0, sharpen8] = load_pair(&mtx.sharpen);
     let sign0 = _mm_cmpgt_epi16(zero, in0);
     let sign8 = _mm_cmpgt_epi16(zero, in8);
-    let coeff0 = _mm_add_epi16(
-        _mm_sub_epi16(_mm_xor_si128(in0, sign0), sign0),
-        _mm_loadu_si128(mtx.sharpen.as_ptr().cast()),
-    );
-    let coeff8 = _mm_add_epi16(
-        _mm_sub_epi16(_mm_xor_si128(in8, sign8), sign8),
-        _mm_loadu_si128(mtx.sharpen.as_ptr().add(8).cast()),
-    );
+    let coeff0 = _mm_add_epi16(_mm_sub_epi16(_mm_xor_si128(in0, sign0), sign0), sharpen0);
+    let coeff8 = _mm_add_epi16(_mm_sub_epi16(_mm_xor_si128(in8, sign8), sign8), sharpen8);
 
     let h0 = _mm_mulhi_epu16(coeff0, iq0);
     let l0 = _mm_mullo_epi16(coeff0, iq0);
     let h8 = _mm_mulhi_epu16(coeff8, iq8);
     let l8 = _mm_mullo_epi16(coeff8, iq8);
-    let bias = |k: usize| _mm_loadu_si128(mtx.bias.as_ptr().add(k).cast());
-    let o00 =
-        _mm_srai_epi32::<{ QFIX as i32 }>(_mm_add_epi32(_mm_unpacklo_epi16(l0, h0), bias(0)));
-    let o04 =
-        _mm_srai_epi32::<{ QFIX as i32 }>(_mm_add_epi32(_mm_unpackhi_epi16(l0, h0), bias(4)));
-    let o08 =
-        _mm_srai_epi32::<{ QFIX as i32 }>(_mm_add_epi32(_mm_unpacklo_epi16(l8, h8), bias(8)));
+    let bias = |k: usize| load_at(&mtx.bias, k);
+    let o00 = _mm_srai_epi32::<{ QFIX as i32 }>(_mm_add_epi32(_mm_unpacklo_epi16(l0, h0), bias(0)));
+    let o04 = _mm_srai_epi32::<{ QFIX as i32 }>(_mm_add_epi32(_mm_unpackhi_epi16(l0, h0), bias(4)));
+    let o08 = _mm_srai_epi32::<{ QFIX as i32 }>(_mm_add_epi32(_mm_unpacklo_epi16(l8, h8), bias(8)));
     let o12 =
         _mm_srai_epi32::<{ QFIX as i32 }>(_mm_add_epi32(_mm_unpackhi_epi16(l8, h8), bias(12)));
     let out0 = _mm_min_epi16(_mm_packs_epi32(o00, o04), max_coeff_2047);
@@ -503,109 +570,128 @@ unsafe fn quantize_regs(
     let z8 = _mm_shufflelo_epi16::<0b11_00_10_01>(out8);
     let z8 = _mm_shuffle_epi32::<0b11_01_10_00>(z8);
     let z8 = _mm_shufflelo_epi16::<0b01_11_10_00>(z8);
-    _mm_storeu_si128(out.as_mut_ptr().cast(), z0);
-    _mm_storeu_si128(out.as_mut_ptr().add(8).cast(), z8);
+    store_i16x16(out, [z0, z8]);
     let packed = _mm_packs_epi16(z0, z8);
     out.swap(3, 12);
-    (dequant, !_mm_movemask_epi8(_mm_cmpeq_epi8(packed, zero)) as u32 & 0xffff)
+    (
+        dequant,
+        !_mm_movemask_epi8(_mm_cmpeq_epi8(packed, zero)) as u32 & 0xffff,
+    )
 }
 
 /// The position of the last non-zero coefficient of `coeffs`, or -1, as libwebp's
 /// `SetResidualCoeffs_SSE2`.
-#[inline]
+#[allow(unsafe_code)]
+#[inline(always)]
 pub(crate) fn last_non_zero(coeffs: &[i16]) -> i32 {
-    let coeffs = &coeffs[..16];
-    unsafe {
-        let packed = _mm_packs_epi16(load_i16x8(coeffs, 0), load_i16x8(coeffs, 8));
-        let zero = _mm_movemask_epi8(_mm_cmpeq_epi8(packed, _mm_setzero_si128())) as u32;
-        31 - (!zero & 0xffff).leading_zeros() as i32
-    }
+    // SAFETY: SSE2 is part of x86_64.
+    unsafe { last_non_zero_sse2(coeffs) }
+}
+
+#[target_feature(enable = "sse2")]
+#[inline]
+fn last_non_zero_sse2(coeffs: &[i16]) -> i32 {
+    let [lo, hi] = load_pair(coeffs);
+    let packed = _mm_packs_epi16(lo, hi);
+    let zero = _mm_movemask_epi8(_mm_cmpeq_epi8(packed, _mm_setzero_si128())) as u32;
+    31 - (!zero & 0xffff).leading_zeros() as i32
 }
 
 /// The luma of the leading pixels of an RGBA row, 16 at a time, as libwebp's
 /// `ConvertRGBToY_SSE2`: the green weight 33059 does not fit an i16, so it is split in two
 /// products. Returns how many it did.
+#[allow(unsafe_code)]
+#[inline(always)]
 pub(crate) fn rgba_to_y_row(line: &[u8], out: &mut [u8]) -> usize {
+    // SAFETY: SSE2 is part of x86_64.
+    unsafe { rgba_to_y_row_sse2(line, out) }
+}
+
+#[target_feature(enable = "sse2")]
+#[inline]
+fn rgba_to_y_row_sse2(line: &[u8], out: &mut [u8]) -> usize {
     let n = out.len().min(line.len() / 4) & !15;
-    // SAFETY: the loads read line[..n * 4] and the stores write out[..n].
-    unsafe {
-        let mask = _mm_set1_epi32(0x00ff_00ff);
-        let k_rb = _mm_set1_epi32(6420 << 16 | 16839);
-        let k_g0 = _mm_set1_epi32(33059 - 16384);
-        let k_g1 = _mm_set1_epi32(16384);
-        let rounder = _mm_set1_epi32((16 << 16) + (1 << 15));
-        let luma = |p: *const u8| {
-            let v = _mm_loadu_si128(p.cast());
-            let rb = _mm_and_si128(v, mask);
-            let ga = _mm_and_si128(_mm_srli_epi32::<8>(v), mask);
-            let y = _mm_add_epi32(
-                _mm_madd_epi16(rb, k_rb),
-                _mm_add_epi32(_mm_madd_epi16(ga, k_g0), _mm_madd_epi16(ga, k_g1)),
-            );
-            _mm_srli_epi32::<16>(_mm_add_epi32(y, rounder))
-        };
-        for i in (0..n).step_by(16) {
-            let p = line.as_ptr().add(i * 4);
-            let lo = _mm_packs_epi32(luma(p), luma(p.add(16)));
-            let hi = _mm_packs_epi32(luma(p.add(32)), luma(p.add(48)));
-            _mm_storeu_si128(out.as_mut_ptr().add(i).cast(), _mm_packus_epi16(lo, hi));
-        }
+    let mask = _mm_set1_epi32(0x00ff_00ff);
+    let k_rb = _mm_set1_epi32(6420 << 16 | 16839);
+    let k_g0 = _mm_set1_epi32(33059 - 16384);
+    let k_g1 = _mm_set1_epi32(16384);
+    let rounder = _mm_set1_epi32((16 << 16) + (1 << 15));
+    let luma = |p: &[u8]| {
+        let v = load(p);
+        let rb = _mm_and_si128(v, mask);
+        let ga = _mm_and_si128(_mm_srli_epi32::<8>(v), mask);
+        let y = _mm_add_epi32(
+            _mm_madd_epi16(rb, k_rb),
+            _mm_add_epi32(_mm_madd_epi16(ga, k_g0), _mm_madd_epi16(ga, k_g1)),
+        );
+        _mm_srli_epi32::<16>(_mm_add_epi32(y, rounder))
+    };
+    let px = line[..n * 4].as_chunks::<64>().0;
+    for (p, out) in px.iter().zip(out[..n].as_chunks_mut::<16>().0) {
+        let lo = _mm_packs_epi32(luma(&p[..16]), luma(&p[16..32]));
+        let hi = _mm_packs_epi32(luma(&p[32..48]), luma(&p[48..]));
+        store(out, _mm_packus_epi16(lo, hi));
     }
     n
 }
 
 /// libwebp's `ConvertRGB24ToY_SSE2`: packed RGB rows to Y, 32 pixels at a time, the channels
 /// pulled apart by five rounds of byte interleaving. Returns how many pixels it converted.
+#[allow(unsafe_code)]
+#[inline(always)]
 pub(crate) fn rgb_to_y_row(line: &[u8], out: &mut [u8]) -> usize {
+    // SAFETY: SSE2 is part of x86_64.
+    unsafe { rgb_to_y_row_sse2(line, out) }
+}
+
+#[target_feature(enable = "sse2")]
+fn rgb_to_y_row_sse2(line: &[u8], out: &mut [u8]) -> usize {
     let n = out.len().min(line.len() / 3) & !31;
-    // SAFETY: the loads read line[..n * 3] and the stores write out[..n].
-    unsafe {
-        let zero = _mm_setzero_si128();
-        let k_rb = _mm_set1_epi32(6420 << 16 | 16839);
-        let k_g0 = _mm_set1_epi32(33059 - 16384);
-        let k_g1 = _mm_set1_epi32(16384);
-        let rounder = _mm_set1_epi32((16 << 16) + (1 << 15));
-        // One round sends byte k of the 96 to 2k mod 95; five send pixel p's channel c, at
-        // 3p + c, to 32c + p.
-        let split = |v: [__m128i; 6]| {
-            [
-                _mm_unpacklo_epi8(v[0], v[3]),
-                _mm_unpackhi_epi8(v[0], v[3]),
-                _mm_unpacklo_epi8(v[1], v[4]),
-                _mm_unpackhi_epi8(v[1], v[4]),
-                _mm_unpacklo_epi8(v[2], v[5]),
-                _mm_unpackhi_epi8(v[2], v[5]),
-            ]
-        };
-        // Four Y in 32-bit lanes from the low four 16-bit r, g and b.
-        let luma = |r, g, b| {
-            let rb = _mm_unpacklo_epi16(r, b);
-            let g0 = _mm_unpacklo_epi16(g, zero);
-            let y = _mm_add_epi32(
-                _mm_madd_epi16(rb, k_rb),
-                _mm_add_epi32(_mm_madd_epi16(g0, k_g0), _mm_madd_epi16(g0, k_g1)),
-            );
-            _mm_srli_epi32::<16>(_mm_add_epi32(y, rounder))
-        };
-        let luma8 = |r, g, b| {
-            let hi = |v| _mm_unpackhi_epi64(v, v);
-            _mm_packs_epi32(luma(r, g, b), luma(hi(r), hi(g), hi(b)))
-        };
-        for i in (0..n).step_by(32) {
-            let p = line.as_ptr().add(i * 3);
-            let mut v = [zero; 6];
-            for (k, v) in v.iter_mut().enumerate() {
-                *v = _mm_loadu_si128(p.add(16 * k).cast());
-            }
-            let planes = split(split(split(split(split(v)))));
-            for j in 0..2 {
-                let (r, g, b) = (planes[j], planes[2 + j], planes[4 + j]);
-                let lo = |v| _mm_unpacklo_epi8(v, zero);
-                let hi = |v| _mm_unpackhi_epi8(v, zero);
-                let y0 = luma8(lo(r), lo(g), lo(b));
-                let y1 = luma8(hi(r), hi(g), hi(b));
-                _mm_storeu_si128(out.as_mut_ptr().add(i + 16 * j).cast(), _mm_packus_epi16(y0, y1));
-            }
+    let zero = _mm_setzero_si128();
+    let k_rb = _mm_set1_epi32(6420 << 16 | 16839);
+    let k_g0 = _mm_set1_epi32(33059 - 16384);
+    let k_g1 = _mm_set1_epi32(16384);
+    let rounder = _mm_set1_epi32((16 << 16) + (1 << 15));
+    // One round sends byte k of the 96 to 2k mod 95; five send pixel p's channel c, at
+    // 3p + c, to 32c + p.
+    let split = |v: [__m128i; 6]| {
+        [
+            _mm_unpacklo_epi8(v[0], v[3]),
+            _mm_unpackhi_epi8(v[0], v[3]),
+            _mm_unpacklo_epi8(v[1], v[4]),
+            _mm_unpackhi_epi8(v[1], v[4]),
+            _mm_unpacklo_epi8(v[2], v[5]),
+            _mm_unpackhi_epi8(v[2], v[5]),
+        ]
+    };
+    // Four Y in 32-bit lanes from the low four 16-bit r, g and b.
+    let luma = |r, g, b| {
+        let rb = _mm_unpacklo_epi16(r, b);
+        let g0 = _mm_unpacklo_epi16(g, zero);
+        let y = _mm_add_epi32(
+            _mm_madd_epi16(rb, k_rb),
+            _mm_add_epi32(_mm_madd_epi16(g0, k_g0), _mm_madd_epi16(g0, k_g1)),
+        );
+        _mm_srli_epi32::<16>(_mm_add_epi32(y, rounder))
+    };
+    let luma8 = |r, g, b| {
+        let hi = |v| _mm_unpackhi_epi64(v, v);
+        _mm_packs_epi32(luma(r, g, b), luma(hi(r), hi(g), hi(b)))
+    };
+    let px = line[..n * 3].as_chunks::<96>().0;
+    for (p, out) in px.iter().zip(out[..n].as_chunks_mut::<32>().0) {
+        let mut v = [zero; 6];
+        for (k, v) in v.iter_mut().enumerate() {
+            *v = load(&p[16 * k..]);
+        }
+        let planes = split(split(split(split(split(v)))));
+        for j in 0..2 {
+            let (r, g, b) = (planes[j], planes[2 + j], planes[4 + j]);
+            let lo = |v| _mm_unpacklo_epi8(v, zero);
+            let hi = |v| _mm_unpackhi_epi8(v, zero);
+            let y0 = luma8(lo(r), lo(g), lo(b));
+            let y1 = luma8(hi(r), hi(g), hi(b));
+            store(&mut out[16 * j..], _mm_packus_epi16(y0, y1));
         }
     }
     n

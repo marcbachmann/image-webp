@@ -1015,14 +1015,19 @@ pub(crate) fn collect_histogram(r: &[u8], pred: &[u8], start: usize, end: usize)
         let off = if j < 16 { SCAN[j] } else { SCAN_UV[j - 16] };
         let mut out = [0i16; 32];
         ftransform2(&r[off..], &pred[off..], &mut out);
-        let bins = out.map(|v| (v.unsigned_abs() >> 3).min(MAX_COEFF_THRESH as u16));
-        for b in bins.chunks_exact(4) {
+        for b in coeff_bins(&out).chunks_exact(4) {
             for (h, &b) in distribution.iter_mut().zip(b) {
                 h[usize::from(b)] += 1;
             }
         }
     }
     histogram_alpha(&distribution)
+}
+
+/// The histogram bins of `coeffs`, out of line: inlined, LLVM computes them one by one.
+#[inline(never)]
+fn coeff_bins(coeffs: &[i16; 32]) -> [u16; 32] {
+    coeffs.map(|v| (v.unsigned_abs() >> 3).min(MAX_COEFF_THRESH as u16))
 }
 
 fn histogram_alpha(distribution: &[[u16; MAX_COEFF_THRESH + 1]; 4]) -> (i32, i32) {

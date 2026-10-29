@@ -1,7 +1,6 @@
 //! AVX2 widenings of the kernels in `sse2.rs`. libwebp has no AVX2 for the VP8 encoder, so
 //! each 128-bit lane runs the SSE2 kernel on a block of its own and the results equal the
 //! SSE2 ones exactly. Callers check `crate::wide::has_avx2()` first.
-#![allow(unsafe_code)]
 
 use core::arch::x86_64::*;
 
@@ -9,30 +8,38 @@ use super::dsp::{
     I4Recon, Matrix, BPS, I4DC4, I4HD4, I4_LOOKUP1, I4_LOOKUP2, I4_LOOKUP3, I4_MODE_OFFSETS,
     MAX_LEVEL, QFIX, ZIGZAG,
 };
+use crate::simd_mem::{load, load_at, store, store_at, Pod};
 
 #[inline(always)]
 fn ld32(p: &[u8], off: usize) -> i32 {
-    i32::from_le_bytes(p[off..off + 4].try_into().unwrap())
+    load_at(p, off)
+}
+
+/// The lanes of `v` as an array.
+#[inline(always)]
+fn lanes(v: __m256i) -> [i32; 8] {
+    let mut out = [0; 8];
+    store(&mut out, v);
+    out
 }
 
 /// The same 128 bits in both lanes.
 #[inline]
 #[target_feature(enable = "avx2")]
-unsafe fn both(v: __m128i) -> __m256i {
+fn both(v: __m128i) -> __m256i {
     _mm256_broadcastsi128_si256(v)
 }
 
 #[inline]
 #[target_feature(enable = "avx2")]
-unsafe fn load_both<T>(p: &[T]) -> __m256i {
-    assert!(core::mem::size_of_val(p) >= 16);
-    both(_mm_loadu_si128(p.as_ptr().cast()))
+fn load_both<T: Pod>(p: &[T]) -> __m256i {
+    both(load(p))
 }
 
 /// The rows `y` and `y + 1` of the 4x4 blocks `a` (low lane) and `b` (high lane) as 16-bit.
 #[inline]
 #[target_feature(enable = "avx2")]
-unsafe fn rows2(a: &[u8], b: &[u8], y: usize) -> __m256i {
+fn rows2(a: &[u8], b: &[u8], y: usize) -> __m256i {
     let a = _mm_unpacklo_epi32(
         _mm_cvtsi32_si128(ld32(a, y * BPS)),
         _mm_cvtsi32_si128(ld32(a, (y + 1) * BPS)),
@@ -48,7 +55,7 @@ unsafe fn rows2(a: &[u8], b: &[u8], y: usize) -> __m256i {
 /// interleaved in pairs as `sse2::ftransform_regs` loads them.
 #[inline]
 #[target_feature(enable = "avx2")]
-unsafe fn rows2_paired(a: &[u8], b: &[u8], y: usize) -> __m256i {
+fn rows2_paired(a: &[u8], b: &[u8], y: usize) -> __m256i {
     let a = _mm_unpacklo_epi16(
         _mm_cvtsi32_si128(ld32(a, y * BPS)),
         _mm_cvtsi32_si128(ld32(a, (y + 1) * BPS)),
@@ -62,7 +69,7 @@ unsafe fn rows2_paired(a: &[u8], b: &[u8], y: usize) -> __m256i {
 
 #[inline]
 #[target_feature(enable = "avx2")]
-unsafe fn transpose_2_4x4(i0: __m256i, i1: __m256i, i2: __m256i, i3: __m256i) -> [__m256i; 4] {
+fn transpose_2_4x4(i0: __m256i, i1: __m256i, i2: __m256i, i3: __m256i) -> [__m256i; 4] {
     let t0_0 = _mm256_unpacklo_epi16(i0, i1);
     let t0_1 = _mm256_unpacklo_epi16(i2, i3);
     let t0_2 = _mm256_unpackhi_epi16(i0, i1);
@@ -81,7 +88,7 @@ unsafe fn transpose_2_4x4(i0: __m256i, i1: __m256i, i2: __m256i, i3: __m256i) ->
 
 #[inline]
 #[target_feature(enable = "avx2")]
-unsafe fn ftransform_pass1(in01: __m256i, in23: __m256i) -> (__m256i, __m256i) {
+fn ftransform_pass1(in01: __m256i, in23: __m256i) -> (__m256i, __m256i) {
     let k937 = _mm256_set1_epi32(937);
     let k1812 = _mm256_set1_epi32(1812);
     let k88p = _mm256_set1_epi16(8);
@@ -111,7 +118,7 @@ unsafe fn ftransform_pass1(in01: __m256i, in23: __m256i) -> (__m256i, __m256i) {
 
 #[inline]
 #[target_feature(enable = "avx2")]
-unsafe fn ftransform_pass2(v01: __m256i, v32: __m256i) -> [__m256i; 2] {
+fn ftransform_pass2(v01: __m256i, v32: __m256i) -> [__m256i; 2] {
     let zero = _mm256_setzero_si256();
     let seven = _mm256_set1_epi16(7);
     let k5352_2217 = _mm256_set1_epi32(5352 << 16 | 2217);
@@ -139,7 +146,7 @@ unsafe fn ftransform_pass2(v01: __m256i, v32: __m256i) -> [__m256i; 2] {
 
 #[inline]
 #[target_feature(enable = "avx2")]
-unsafe fn quant_shift(v: __m256i, bias: &[u32]) -> __m256i {
+fn quant_shift(v: __m256i, bias: &[u32]) -> __m256i {
     _mm256_srai_epi32::<{ QFIX as i32 }>(_mm256_add_epi32(v, load_both(bias)))
 }
 
@@ -149,7 +156,7 @@ unsafe fn quant_shift(v: __m256i, bias: &[u32]) -> __m256i {
 /// their high halves.
 #[inline]
 #[target_feature(enable = "avx2")]
-unsafe fn quantize_regs(in0: __m256i, in8: __m256i, mtx: &Matrix) -> ([__m256i; 2], [__m256i; 2]) {
+fn quantize_regs(in0: __m256i, in8: __m256i, mtx: &Matrix) -> ([__m256i; 2], [__m256i; 2]) {
     let max_coeff_2047 = _mm256_set1_epi16(MAX_LEVEL as i16);
     let zero = _mm256_setzero_si256();
     let iq0 = load_both(&mtx.iq[..8]);
@@ -191,7 +198,7 @@ unsafe fn quantize_regs(in0: __m256i, in8: __m256i, mtx: &Matrix) -> ([__m256i; 
 
 #[inline]
 #[target_feature(enable = "avx2")]
-unsafe fn itransform_pass<const SHIFT: bool>(
+fn itransform_pass<const SHIFT: bool>(
     x01: __m256i,
     x23: __m256i,
     round: __m256i,
@@ -234,11 +241,7 @@ unsafe fn itransform_pass<const SHIFT: bool>(
 /// (16-bit), returning each lane's four rows packed.
 #[inline]
 #[target_feature(enable = "avx2")]
-unsafe fn itransform_one_rows(
-    [in01, in23]: [__m256i; 2],
-    ref01: __m256i,
-    ref23: __m256i,
-) -> __m256i {
+fn itransform_one_rows([in01, in23]: [__m256i; 2], ref01: __m256i, ref23: __m256i) -> __m256i {
     let zero = _mm256_setzero_si256();
     let zero_four = _mm256_set_epi64x(0, 0x0004_0004_0004_0004, 0, 0x0004_0004_0004_0004);
 
@@ -249,7 +252,7 @@ unsafe fn itransform_one_rows(
 
 #[inline]
 #[target_feature(enable = "avx2")]
-unsafe fn hadamard4(t0: __m256i, t1: __m256i, t2: __m256i, t3: __m256i) -> [__m256i; 4] {
+fn hadamard4(t0: __m256i, t1: __m256i, t2: __m256i, t3: __m256i) -> [__m256i; 4] {
     let a0 = _mm256_add_epi16(t0, t2);
     let a1 = _mm256_add_epi16(t1, t3);
     let a2 = _mm256_sub_epi16(t1, t3);
@@ -266,7 +269,7 @@ unsafe fn hadamard4(t0: __m256i, t1: __m256i, t2: __m256i, t3: __m256i) -> [__m2
 /// layout, the low halves' then the high halves', each still spread over four lanes.
 #[inline]
 #[target_feature(enable = "avx2")]
-unsafe fn ttransform_sums([t0, t1, t2, t3]: [__m256i; 4], w: &[u16; 16]) -> [__m256i; 2] {
+fn ttransform_sums([t0, t1, t2, t3]: [__m256i; 4], w: &[u16; 16]) -> [__m256i; 2] {
     let b4 = hadamard4(t0, t1, t2, t3);
     let t = transpose_2_4x4(b4[0], b4[1], b4[2], b4[3]);
     let b4 = hadamard4(t[0], t[1], t[2], t[3]);
@@ -285,7 +288,7 @@ unsafe fn ttransform_sums([t0, t1, t2, t3]: [__m256i; 4], w: &[u16; 16]) -> [__m
 /// `[sum(p), sum(q), sum(p), sum(q)]`.
 #[inline]
 #[target_feature(enable = "avx2")]
-unsafe fn ttransform_pair(p: [__m256i; 2], q: [__m256i; 2], w: &[u16; 16]) -> [i32; 8] {
+fn ttransform_pair(p: [__m256i; 2], q: [__m256i; 2], w: &[u16; 16]) -> [i32; 8] {
     let [sa, sb] = ttransform_sums(
         [
             _mm256_unpacklo_epi64(p[0], q[0]),
@@ -296,7 +299,7 @@ unsafe fn ttransform_pair(p: [__m256i; 2], q: [__m256i; 2], w: &[u16; 16]) -> [i
         w,
     );
     let h = _mm256_hadd_epi32(sa, sb);
-    core::mem::transmute(_mm256_hadd_epi32(h, h))
+    lanes(_mm256_hadd_epi32(h, h))
 }
 
 /// The raw TDisto of `src` against the ten reconstructions `o` (rows as `itransform_sse_x2`
@@ -304,7 +307,7 @@ unsafe fn ttransform_pair(p: [__m256i; 2], q: [__m256i; 2], w: &[u16; 16]) -> [i
 /// along with the last pair.
 #[inline]
 #[target_feature(enable = "avx2")]
-unsafe fn disto_modes(src: &[u8], o: &[[__m256i; 2]; 5], w: &[u16; 16], out: &mut [I4Recon; 10]) {
+fn disto_modes(src: &[u8], o: &[[__m256i; 2]; 5], w: &[u16; 16], out: &mut [I4Recon; 10]) {
     let s = [rows2(src, src, 0), rows2(src, src, 2)];
     let g0 = ttransform_pair(o[0], o[1], w);
     let g1 = ttransform_pair(o[2], o[3], w);
@@ -319,6 +322,7 @@ unsafe fn disto_modes(src: &[u8], o: &[[__m256i; 2]; 5], w: &[u16; 16], out: &mu
 
 /// `reconstruct4x4_disto_x2` of the ten 4x4 predictions in `preds`, then their raw TDisto;
 /// `None` without AVX2.
+#[allow(unsafe_code)]
 #[inline]
 pub(crate) fn reconstruct4x4_disto_modes(
     src: &[u8],
@@ -330,25 +334,18 @@ pub(crate) fn reconstruct4x4_disto_modes(
         return None;
     }
     let mut out = [I4Recon::default(); 10];
-    // SAFETY: the CPU supports AVX2.
-    unsafe {
-        let mut o = [[_mm256_setzero_si256(); 2]; 5];
-        for (m, (out, o)) in out
-            .as_chunks_mut::<2>()
-            .0
-            .iter_mut()
-            .zip(&mut o)
-            .enumerate()
-        {
-            let r = [
-                &preds[I4_MODE_OFFSETS[2 * m]..],
-                &preds[I4_MODE_OFFSETS[2 * m + 1]..],
-            ];
-            *o = reconstruct4x4_disto_x2(src, r, mtx, out);
-        }
-        if let Some(w) = w {
-            disto_modes(src, &o, w, &mut out);
-        }
+    let pairs = out.as_chunks_mut::<2>().0;
+    let o: [[__m256i; 2]; 5] = core::array::from_fn(|m| {
+        let r = [
+            &preds[I4_MODE_OFFSETS[2 * m]..],
+            &preds[I4_MODE_OFFSETS[2 * m + 1]..],
+        ];
+        // SAFETY: the CPU supports AVX2.
+        unsafe { reconstruct4x4_disto_x2(src, r, mtx, &mut pairs[m]) }
+    });
+    if let Some(w) = w {
+        // SAFETY: the CPU supports AVX2.
+        unsafe { disto_modes(src, &o, w, &mut out) };
     }
     Some(out)
 }
@@ -357,7 +354,7 @@ pub(crate) fn reconstruct4x4_disto_modes(
 /// `r[1]`, one per lane, the reconstructions packed into `I4Recon::pixels`, without
 /// `disto`. Returns the reconstructions' rows as `itransform_sse_x2` does.
 #[target_feature(enable = "avx2")]
-pub(crate) unsafe fn reconstruct4x4_disto_x2(
+pub(crate) fn reconstruct4x4_disto_x2(
     src: &[u8],
     r: [&[u8]; 2],
     mtx: &Matrix,
@@ -370,8 +367,8 @@ pub(crate) unsafe fn reconstruct4x4_disto_x2(
     let packed = _mm256_packs_epi16(z0, z8);
     let non_zero = !_mm256_movemask_epi8(_mm256_cmpeq_epi8(packed, _mm256_setzero_si256())) as u32;
     let mut lv = [[0i16; 8]; 4];
-    _mm256_storeu_si256(lv[0..2].as_mut_ptr().cast(), z0);
-    _mm256_storeu_si256(lv[2..4].as_mut_ptr().cast(), z8);
+    store(lv[..2].as_flattened_mut(), z0);
+    store(lv[2..].as_flattened_mut(), z8);
     for (k, o) in out.iter_mut().enumerate() {
         o.levels[..8].copy_from_slice(&lv[k]);
         o.levels[8..].copy_from_slice(&lv[2 + k]);
@@ -386,7 +383,7 @@ pub(crate) unsafe fn reconstruct4x4_disto_x2(
 /// `sse2::ftransform_regs` of `src - r0` (low lane) and `src - r1` (high lane).
 #[inline]
 #[target_feature(enable = "avx2")]
-unsafe fn ftransform_x2(src: &[u8], r0: &[u8], r1: &[u8]) -> [__m256i; 2] {
+fn ftransform_x2(src: &[u8], r0: &[u8], r1: &[u8]) -> [__m256i; 2] {
     let src = &src[..3 * BPS + 4];
     let row01 = _mm256_sub_epi16(rows2_paired(src, src, 0), rows2_paired(r0, r1, 0));
     let row23 = _mm256_sub_epi16(rows2_paired(src, src, 2), rows2_paired(r0, r1, 2));
@@ -399,7 +396,7 @@ unsafe fn ftransform_x2(src: &[u8], r0: &[u8], r1: &[u8]) -> [__m256i; 2] {
 /// reconstructions' rows 0-1 and 2-3 as 16-bit.
 #[inline]
 #[target_feature(enable = "avx2")]
-unsafe fn itransform_sse_x2(
+fn itransform_sse_x2(
     src: &[u8],
     r0: &[u8],
     r1: &[u8],
@@ -417,8 +414,8 @@ unsafe fn itransform_sse_x2(
     let sums = _mm256_hadd_epi32(sse, zero);
     let sums = _mm256_hadd_epi32(sums, zero);
     let mut px = [[0u8; 16]; 2];
-    _mm256_storeu_si256(px.as_mut_ptr().cast(), packed);
-    let sums: [i32; 8] = core::mem::transmute(sums);
+    store(px.as_flattened_mut(), packed);
+    let sums = lanes(sums);
     for (k, o) in out[..2].iter_mut().enumerate() {
         o.pixels = px[k];
         o.d = sums[4 * k];
@@ -430,7 +427,7 @@ unsafe fn itransform_sse_x2(
 /// `sse2::ftransform` of `src` against each of the ten 4x4 predictions in `preds`, two per
 /// register.
 #[target_feature(enable = "avx2")]
-pub(crate) unsafe fn ftransform_modes(src: &[u8], preds: &[u8], out: &mut [[i16; 16]; 10]) {
+pub(crate) fn ftransform_modes(src: &[u8], preds: &[u8], out: &mut [[i16; 16]; 10]) {
     for (m, out) in out.as_chunks_mut::<2>().0.iter_mut().enumerate() {
         let r0 = &preds[I4_MODE_OFFSETS[2 * m]..][..3 * BPS + 4];
         let r1 = &preds[I4_MODE_OFFSETS[2 * m + 1]..][..3 * BPS + 4];
@@ -443,7 +440,7 @@ pub(crate) unsafe fn ftransform_modes(src: &[u8], preds: &[u8], out: &mut [[i16;
 /// `itransform_one_disto` of each `coeffs[m]` added to the prediction of mode `m` in
 /// `preds`, two per register, into `out[m]`'s `pixels`, `d` and raw `disto`.
 #[target_feature(enable = "avx2")]
-pub(crate) unsafe fn itransform_disto_modes(
+pub(crate) fn itransform_disto_modes(
     src: &[u8],
     preds: &[u8],
     coeffs: &[[i16; 16]; 10],
@@ -475,27 +472,27 @@ pub(crate) unsafe fn itransform_disto_modes(
 
 #[inline]
 #[target_feature(enable = "avx2")]
-unsafe fn load16(p: &[u8], off: usize) -> __m256i {
-    _mm256_cvtepu8_epi16(_mm_loadu_si128(p[off..off + 16].as_ptr().cast()))
+fn load16(p: &[u8], off: usize) -> __m256i {
+    _mm256_cvtepu8_epi16(load_at(p, off))
 }
 
 #[inline]
 #[target_feature(enable = "avx2")]
-unsafe fn load_i16x16(p: &[i16]) -> __m256i {
-    _mm256_loadu_si256(p[..16].as_ptr().cast())
+fn load_i16x16(p: &[i16]) -> __m256i {
+    load(&p[..16])
 }
 
 #[inline]
 #[target_feature(enable = "avx2")]
-unsafe fn store_i16x16(p: &mut [i16], v: __m256i) {
-    _mm256_storeu_si256(p[..16].as_mut_ptr().cast(), v)
+fn store_i16x16(p: &mut [i16], v: __m256i) {
+    store(&mut p[..16], v)
 }
 
 /// The coefficients of the four 4x4 blocks side by side at `src - r`: blocks 0 | 2 rows
 /// 0-1, 0 | 2 rows 2-3, then the same of blocks 1 | 3.
 #[inline]
 #[target_feature(enable = "avx2")]
-unsafe fn ftransform4_regs(src: &[u8], r: &[u8]) -> [__m256i; 4] {
+fn ftransform4_regs(src: &[u8], r: &[u8]) -> [__m256i; 4] {
     let src = &src[..3 * BPS + 16];
     let r = &r[..3 * BPS + 16];
     let d0 = _mm256_sub_epi16(load16(src, 0), load16(r, 0));
@@ -514,7 +511,7 @@ unsafe fn ftransform4_regs(src: &[u8], r: &[u8]) -> [__m256i; 4] {
 /// `sse2::ftransform2` of the two pairs of 4x4 blocks side by side at `src - r`, the left
 /// pair into `lo` and the right one into `hi`, 32 coefficients each.
 #[target_feature(enable = "avx2")]
-pub(crate) unsafe fn ftransform4(src: &[u8], r: &[u8], lo: &mut [i16], hi: &mut [i16]) {
+pub(crate) fn ftransform4(src: &[u8], r: &[u8], lo: &mut [i16], hi: &mut [i16]) {
     let [l0, l8, h0, h8] = ftransform4_regs(src, r);
     store_i16x16(&mut lo[..16], _mm256_permute2x128_si256::<0x20>(l0, l8));
     store_i16x16(&mut lo[16..32], _mm256_permute2x128_si256::<0x20>(h0, h8));
@@ -525,7 +522,7 @@ pub(crate) unsafe fn ftransform4(src: &[u8], r: &[u8], lo: &mut [i16], hi: &mut 
 /// `dsp::collect_histogram`'s counts of the blocks in the 16-pixel rows at `rows` of
 /// `src - r`, into `distribution`.
 #[target_feature(enable = "avx2")]
-pub(crate) unsafe fn histogram_rows(
+pub(crate) fn histogram_rows(
     src: &[u8],
     r: &[u8],
     rows: &[usize],
@@ -538,8 +535,8 @@ pub(crate) unsafe fn histogram_rows(
         let mut bins = [0u8; 64];
         let b01 = _mm256_packus_epi16(bin(c[0]), bin(c[1]));
         let b23 = _mm256_packus_epi16(bin(c[2]), bin(c[3]));
-        _mm256_storeu_si256(bins.as_mut_ptr().cast(), b01);
-        _mm256_storeu_si256(bins.as_mut_ptr().add(32).cast(), b23);
+        store(&mut bins, b01);
+        store_at(&mut bins, 32, b23);
         for b in bins.as_chunks::<4>().0 {
             for (h, &b) in distribution.iter_mut().zip(b) {
                 h[usize::from(b)] += 1;
@@ -550,7 +547,7 @@ pub(crate) unsafe fn histogram_rows(
 
 #[inline]
 #[target_feature(enable = "avx2")]
-unsafe fn itransform_two_pass<const SHIFT: bool>(
+fn itransform_two_pass<const SHIFT: bool>(
     x0: __m256i,
     x1: __m256i,
     x2: __m256i,
@@ -587,7 +584,7 @@ unsafe fn itransform_two_pass<const SHIFT: bool>(
 /// `sse2::itransform_two` of the pairs of blocks `lo` and `hi` (32 coefficients each) added
 /// to the 16-pixel rows of `r`, into `dst`.
 #[target_feature(enable = "avx2")]
-pub(crate) unsafe fn itransform4(r: &[u8], lo: &[i16], hi: &[i16], dst: &mut [u8]) {
+pub(crate) fn itransform4(r: &[u8], lo: &[i16], hi: &[i16], dst: &mut [u8]) {
     let r = &r[..3 * BPS + 16];
     let dst = &mut dst[..3 * BPS + 16];
     let (b0, b1) = (load_i16x16(&lo[..16]), load_i16x16(&lo[16..32]));
@@ -608,10 +605,8 @@ pub(crate) unsafe fn itransform4(r: &[u8], lo: &[i16], hi: &[i16], dst: &mut [u8
         let a = _mm256_add_epi16(load16(r, y * BPS), t[y]);
         let b = _mm256_add_epi16(load16(r, (y + 1) * BPS), t[y + 1]);
         let px = _mm256_permute4x64_epi64::<0b11_01_10_00>(_mm256_packus_epi16(a, b));
-        let row0 = &mut dst[y * BPS..y * BPS + 16];
-        _mm_storeu_si128(row0.as_mut_ptr().cast(), _mm256_castsi256_si128(px));
-        let row1 = &mut dst[(y + 1) * BPS..(y + 1) * BPS + 16];
-        _mm_storeu_si128(row1.as_mut_ptr().cast(), _mm256_extracti128_si256::<1>(px));
+        store_at(dst, y * BPS, _mm256_castsi256_si128(px));
+        store_at(dst, (y + 1) * BPS, _mm256_extracti128_si256::<1>(px));
     }
 }
 
@@ -619,11 +614,10 @@ pub(crate) unsafe fn itransform4(r: &[u8], lo: &[i16], hi: &[i16], dst: &mut [u8
 /// `[blk0, blk1, blk0, blk1]` then `[blk2, blk3, blk2, blk3]`.
 #[inline]
 #[target_feature(enable = "avx2")]
-unsafe fn tsums_band(a: &[u8], y: usize, w: &[u16; 16]) -> __m256i {
+fn tsums_band(a: &[u8], y: usize, w: &[u16; 16]) -> __m256i {
     let mut t = [_mm256_setzero_si256(); 4];
     for (i, t) in t.iter_mut().enumerate() {
-        let off = (y + i) * BPS;
-        *t = _mm256_cvtepu8_epi16(_mm_loadu_si128(a[off..off + 16].as_ptr().cast()));
+        *t = load16(a, (y + i) * BPS);
     }
     let [sa, sb] = ttransform_sums(t, w);
     let h = _mm256_hadd_epi32(sa, sb);
@@ -632,28 +626,25 @@ unsafe fn tsums_band(a: &[u8], y: usize, w: &[u16; 16]) -> __m256i {
 
 /// The source half of `tdisto16x16`: `tsums_band` of each band of `a`.
 #[target_feature(enable = "avx2")]
-pub(crate) unsafe fn tsums16x16(a: &[u8], w: &[u16; 16]) -> [[i32; 8]; 4] {
+pub(crate) fn tsums16x16(a: &[u8], w: &[u16; 16]) -> [[i32; 8]; 4] {
     let a = &a[..15 * BPS + 16];
     let mut out = [[0; 8]; 4];
     for (y, o) in out.iter_mut().enumerate() {
-        *o = core::mem::transmute(tsums_band(a, 4 * y, w));
+        *o = lanes(tsums_band(a, 4 * y, w));
     }
     out
 }
 
 /// `dsp::tdisto16x16` of `b` against the source whose `tsums16x16` are `src`.
 #[target_feature(enable = "avx2")]
-pub(crate) unsafe fn tdisto16x16(src: &[[i32; 8]; 4], b: &[u8], w: &[u16; 16]) -> i32 {
+pub(crate) fn tdisto16x16(src: &[[i32; 8]; 4], b: &[u8], w: &[u16; 16]) -> i32 {
     let b = &b[..15 * BPS + 16];
     let mut acc = _mm256_setzero_si256();
     for (y, s) in src.iter().enumerate() {
-        let d = _mm256_sub_epi32(
-            _mm256_loadu_si256(s.as_ptr().cast()),
-            tsums_band(b, 4 * y, w),
-        );
+        let d = _mm256_sub_epi32(load(s), tsums_band(b, 4 * y, w));
         acc = _mm256_add_epi32(acc, _mm256_srai_epi32::<5>(_mm256_abs_epi32(d)));
     }
-    let acc: [i32; 8] = core::mem::transmute(acc);
+    let acc = lanes(acc);
     acc[0] + acc[1] + acc[4] + acc[5]
 }
 
@@ -687,7 +678,7 @@ static ZIGZAG_HI: [u16; 256] = zigzag_bits::<1>();
 /// The trellis' last candidate position: the highest `n` in `first..16` whose coefficient
 /// `input[ZIGZAG[n]]` squared is above `thresh`, else `first - 1`.
 #[target_feature(enable = "avx2")]
-pub(crate) unsafe fn trellis_last(input: &[i16; 16], first: usize, thresh: i32) -> i32 {
+pub(crate) fn trellis_last(input: &[i16; 16], first: usize, thresh: i32) -> i32 {
     let v = load_i16x16(input);
     let lo = _mm256_mullo_epi16(v, v);
     let hi = _mm256_mulhi_epi16(v, v);
@@ -709,7 +700,7 @@ pub(crate) unsafe fn trellis_last(input: &[i16; 16], first: usize, thresh: i32) 
 /// Four Y in each lane's 32-bit words from the 16-bit `rb` (r, b pairs) and `g0` (g, 0 pairs).
 #[inline]
 #[target_feature(enable = "avx2")]
-unsafe fn luma4(rb: __m256i, g0: __m256i) -> __m256i {
+fn luma4(rb: __m256i, g0: __m256i) -> __m256i {
     let k_rb = _mm256_set1_epi32(6420 << 16 | 16839);
     let k_g0 = _mm256_set1_epi32(33059 - 16384);
     let k_g1 = _mm256_set1_epi32(16384);
@@ -723,7 +714,7 @@ unsafe fn luma4(rb: __m256i, g0: __m256i) -> __m256i {
 
 /// `sse2::rgba_to_y_row`, 32 pixels at a time. Returns how many it did.
 #[target_feature(enable = "avx2")]
-pub(crate) unsafe fn rgba_to_y_row(line: &[u8], out: &mut [u8]) -> usize {
+pub(crate) fn rgba_to_y_row(line: &[u8], out: &mut [u8]) -> usize {
     let n = out.len().min(line.len() / 4) & !31;
     let line = &line[..n * 4];
     let out = &mut out[..n];
@@ -737,7 +728,7 @@ pub(crate) unsafe fn rgba_to_y_row(line: &[u8], out: &mut [u8]) -> usize {
     {
         let mut y = [_mm256_setzero_si256(); 4];
         for (k, y) in y.iter_mut().enumerate() {
-            let v = _mm256_loadu_si256(px[32 * k..32 * k + 32].as_ptr().cast());
+            let v = load(&px[32 * k..]);
             let rb = _mm256_and_si256(v, mask);
             let ga = _mm256_and_si256(_mm256_srli_epi32::<8>(v), mask);
             *y = luma4(rb, ga);
@@ -747,14 +738,14 @@ pub(crate) unsafe fn rgba_to_y_row(line: &[u8], out: &mut [u8]) -> usize {
             _mm256_packs_epi32(y[2], y[3]),
         );
         let packed = _mm256_permutevar8x32_epi32(packed, order);
-        _mm256_storeu_si256(out.as_mut_ptr().cast(), packed);
+        store(out, packed);
     }
     n
 }
 
 #[inline]
 #[target_feature(enable = "avx2")]
-unsafe fn split6(v: [__m256i; 6]) -> [__m256i; 6] {
+fn split6(v: [__m256i; 6]) -> [__m256i; 6] {
     [
         _mm256_unpacklo_epi8(v[0], v[3]),
         _mm256_unpackhi_epi8(v[0], v[3]),
@@ -768,7 +759,7 @@ unsafe fn split6(v: [__m256i; 6]) -> [__m256i; 6] {
 /// Eight Y as 16-bit from the 16-bit `r`, `g` and `b` of each lane.
 #[inline]
 #[target_feature(enable = "avx2")]
-unsafe fn luma8(r: __m256i, g: __m256i, b: __m256i) -> __m256i {
+fn luma8(r: __m256i, g: __m256i, b: __m256i) -> __m256i {
     let zero = _mm256_setzero_si256();
     let lo = luma4(_mm256_unpacklo_epi16(r, b), _mm256_unpacklo_epi16(g, zero));
     let hi = luma4(_mm256_unpackhi_epi16(r, b), _mm256_unpackhi_epi16(g, zero));
@@ -778,7 +769,7 @@ unsafe fn luma8(r: __m256i, g: __m256i, b: __m256i) -> __m256i {
 /// `sse2::rgb_to_y_row`, 64 pixels at a time: each lane deinterleaves 32 of them as the
 /// SSE2 kernel does. Returns how many pixels it converted.
 #[target_feature(enable = "avx2")]
-pub(crate) unsafe fn rgb_to_y_row(line: &[u8], out: &mut [u8]) -> usize {
+pub(crate) fn rgb_to_y_row(line: &[u8], out: &mut [u8]) -> usize {
     let n = out.len().min(line.len() / 3) & !63;
     let line = &line[..n * 3];
     let out = &mut out[..n];
@@ -791,8 +782,8 @@ pub(crate) unsafe fn rgb_to_y_row(line: &[u8], out: &mut [u8]) -> usize {
     {
         let mut v = [zero; 6];
         for (k, v) in v.iter_mut().enumerate() {
-            let lo = _mm_loadu_si128(px[16 * k..16 * k + 16].as_ptr().cast());
-            let hi = _mm_loadu_si128(px[96 + 16 * k..112 + 16 * k].as_ptr().cast());
+            let lo = load(&px[16 * k..]);
+            let hi = load(&px[96 + 16 * k..]);
             *v = _mm256_set_m128i(hi, lo);
         }
         let planes = split6(split6(split6(split6(split6(v)))));
@@ -814,8 +805,8 @@ pub(crate) unsafe fn rgb_to_y_row(line: &[u8], out: &mut [u8]) -> usize {
         // y[j] holds pixels 16j.. of the first 32 in its low lane, of the second in its high.
         let first = _mm256_permute2x128_si256::<0x20>(y[0], y[1]);
         let second = _mm256_permute2x128_si256::<0x31>(y[0], y[1]);
-        _mm256_storeu_si256(out.as_mut_ptr().cast(), first);
-        _mm256_storeu_si256(out.as_mut_ptr().add(32).cast(), second);
+        store(out, first);
+        store_at(out, 32, second);
     }
     n
 }
@@ -851,21 +842,21 @@ const PRED4_AVG3: [[u8; 32]; 5] = pred4_lookup::<1>();
 
 #[inline]
 #[target_feature(enable = "avx2")]
-unsafe fn pred4_row(avg2: __m256i, avg3: __m256i, r: usize) -> __m256i {
-    let lo = _mm256_loadu_si256(PRED4_AVG2[r].as_ptr().cast());
-    let hi = _mm256_loadu_si256(PRED4_AVG3[r].as_ptr().cast());
+fn pred4_row(avg2: __m256i, avg3: __m256i, r: usize) -> __m256i {
+    let lo = load(&PRED4_AVG2[r]);
+    let hi = load(&PRED4_AVG3[r]);
     _mm256_or_si256(_mm256_shuffle_epi8(avg2, lo), _mm256_shuffle_epi8(avg3, hi))
 }
 
 /// `dsp::pred_luma4` as `neon::pred_luma4` computes it: the averages of the edge picked into
 /// whole rows of four modes.
 #[target_feature(enable = "avx2")]
-pub(crate) unsafe fn pred_luma4(dst: &mut [u8], b: &[u8], t: usize) {
+pub(crate) fn pred_luma4(dst: &mut [u8], b: &[u8], t: usize) {
     let edge = &b[t - 5..t + 11];
     let dst = &mut dst[I4DC4..I4DC4 + 7 * BPS + 8];
     // L K J I X A B C D E F G H
-    let edge = _mm_loadu_si128(edge.as_ptr().cast());
-    let prev = _mm_shuffle_epi8(edge, _mm_loadu_si128(I4_LOOKUP1.as_ptr().cast()));
+    let edge = load(edge);
+    let prev = _mm_shuffle_epi8(edge, load(&I4_LOOKUP1));
     let next = _mm_srli_si128::<2>(prev);
     let avg2 = _mm_avg_epu8(prev, edge);
     let lsb = _mm_and_si128(_mm_xor_si128(prev, next), _mm_set1_epi8(1));
@@ -908,7 +899,7 @@ pub(crate) unsafe fn pred_luma4(dst: &mut [u8], b: &[u8], t: usize) {
     for (y, tm) in tm.into_iter().enumerate() {
         let row = pred4_row(avg2, avg3, y);
         let row = _mm256_blend_epi32::<0b10>(row, _mm256_castsi128_si256(tm));
-        _mm256_storeu_si256(dst[y * BPS..y * BPS + 32].as_mut_ptr().cast(), row);
+        store_at(dst, y * BPS, row);
     }
     let hd_hu = pred4_row(avg2, avg3, 4);
     let (lo, hi) = (
@@ -925,11 +916,12 @@ pub(crate) unsafe fn pred_luma4(dst: &mut [u8], b: &[u8], t: usize) {
     .into_iter()
     .enumerate()
     {
-        _mm_storel_epi64(dst[o + y * BPS..o + y * BPS + 8].as_mut_ptr().cast(), v);
+        store_at(dst, o + y * BPS, _mm_cvtsi128_si64(v));
     }
 }
 
 #[cfg(test)]
+#[allow(unsafe_code)]
 mod tests {
     use super::super::dsp::{bias, I4Recon, Matrix, BPS, QFIX};
     use rand::{Rng, SeedableRng};
