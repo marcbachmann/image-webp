@@ -1110,21 +1110,18 @@ impl<'a> Encoder<'a> {
     // ---------------------------------------------------------------------------------------
     // Reconstruction
 
-    fn reconstruct_intra16(
-        &mut self,
+    /// The 16x16 blocks of `mode` transformed into `tmp`, the DC levels quantized through
+    /// the WHT and the dequantized DCs returned with their non-zero bit: what every row's
+    /// coding needs first.
+    fn transform_intra16(
+        &self,
         dc_levels: &mut [i16; 16],
-        ac_levels: &mut [[i16; 16]; 16],
-        to_out2: bool,
+        tmp: &mut [[i16; 16]; 16],
         mode: usize,
-    ) -> u32 {
-        let seg = self.mb().segment as usize;
-        let dqm = &self.dqm[seg];
+    ) -> (u32, [i16; 16]) {
+        let dqm = &self.dqm[self.mb().segment as usize];
         let r = &self.it.yuv_p[I16_MODE_OFFSETS[mode]..];
         let src = &self.it.yuv_in[Y_OFF..];
-        let mut nz = 0u32;
-        let mut tmp = [[0i16; 16]; 16];
-        let mut dc_tmp = [0i16; 16];
-
         for (y, row) in tmp.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let (lo, hi) = row.split_at_mut(2);
             let off = y * 4 * BPS;
@@ -1135,34 +1132,47 @@ impl<'a> Encoder<'a> {
                 hi.as_flattened_mut(),
             );
         }
+        let mut dc_tmp = [0i16; 16];
         ftransform_wht(tmp.as_flattened(), &mut dc_tmp);
-        nz |= u32::from(quantize_block(&mut dc_tmp, dc_levels, &dqm.y2)) << 24;
+        let nz = u32::from(quantize_block(&mut dc_tmp, dc_levels, &dqm.y2)) << 24;
+        let mut wht = [0i16; 256];
+        transform_wht(&dc_tmp, &mut wht);
+        (nz, std::array::from_fn(|n| wht[n * 16]))
+    }
 
+    /// Quantizes the AC levels of `row` (0..4) of the 16x16 blocks in `tmp`, the trellis in
+    /// raster order from the contexts the rows before left. Returns the row's non-zero bits.
+    fn quantize_intra16_row(
+        &mut self,
+        row: usize,
+        tmp: &mut [[i16; 16]; 16],
+        ac_levels: &mut [[i16; 16]; 16],
+    ) -> u32 {
+        let dqm = &self.dqm[self.mb().segment as usize];
+        let n0 = row * 4;
+        let mut nz = 0u32;
         if self.it.do_trellis {
             let y1 = dqm.y1;
             let lambda = dqm.lambda_trellis_i16;
-            self.nz_to_bytes();
-            for y in 0..4 {
-                for x in 0..4 {
-                    let n = y * 4 + x;
-                    let ctx = (self.it.top_nz[x] + self.it.left_nz[y]) as usize;
-                    let non_zero = trellis_quantize_block(
-                        &self.proba,
-                        &mut tmp[n],
-                        &mut ac_levels[n],
-                        ctx,
-                        0,
-                        &y1,
-                        lambda,
-                    );
-                    self.it.top_nz[x] = i32::from(non_zero);
-                    self.it.left_nz[y] = i32::from(non_zero);
-                    ac_levels[n][0] = 0;
-                    nz |= u32::from(non_zero) << n;
-                }
+            for x in 0..4 {
+                let n = n0 + x;
+                let ctx = (self.it.top_nz[x] + self.it.left_nz[row]) as usize;
+                let non_zero = trellis_quantize_block(
+                    &self.proba,
+                    &mut tmp[n],
+                    &mut ac_levels[n],
+                    ctx,
+                    0,
+                    &y1,
+                    lambda,
+                );
+                self.it.top_nz[x] = i32::from(non_zero);
+                self.it.left_nz[row] = i32::from(non_zero);
+                ac_levels[n][0] = 0;
+                nz |= u32::from(non_zero) << n;
             }
         } else {
-            for n in (0..16).step_by(2) {
+            for n in (n0..n0 + 4).step_by(2) {
                 tmp[n][0] = 0;
                 tmp[n + 1][0] = 0;
                 nz |= quantize2_blocks(
@@ -1172,22 +1182,59 @@ impl<'a> Encoder<'a> {
                 ) << n;
             }
         }
+        nz
+    }
 
-        transform_wht(&dc_tmp, tmp.as_flattened_mut());
+    /// `quantize_intra16_row` and the row's reconstruction with `dcs` from
+    /// `transform_intra16`, into `yuv_out2` or `yuv_out`. Returns the row's non-zero bits and
+    /// its distortion.
+    fn reconstruct_intra16_row(
+        &mut self,
+        row: usize,
+        tmp: &mut [[i16; 16]; 16],
+        dcs: &[i16; 16],
+        ac_levels: &mut [[i16; 16]; 16],
+        to_out2: bool,
+        mode: usize,
+    ) -> (u32, i32) {
+        let nz = self.quantize_intra16_row(row, tmp, ac_levels);
+        let n0 = row * 4;
+        for n in n0..n0 + 4 {
+            tmp[n][0] = dcs[n];
+        }
         let it = &mut self.it;
-        let r = &it.yuv_p[I16_MODE_OFFSETS[mode]..];
+        let off = row * 4 * BPS;
+        let r = &it.yuv_p[I16_MODE_OFFSETS[mode] + off..];
         let dst = if to_out2 {
-            &mut it.yuv_out2[..]
+            &mut it.yuv_out2[Y_OFF + off..]
         } else {
-            &mut it.yuv_out[..]
+            &mut it.yuv_out[Y_OFF + off..]
         };
-        for y in 0..4 {
-            let (off, n) = (y * 4 * BPS, 4 * y);
-            let (lo, hi) = (
-                tmp[n..n + 2].as_flattened(),
-                tmp[n + 2..n + 4].as_flattened(),
-            );
-            itransform4(&r[off..], lo, hi, &mut dst[Y_OFF + off..]);
+        let (lo, hi) = (
+            tmp[n0..n0 + 2].as_flattened(),
+            tmp[n0 + 2..n0 + 4].as_flattened(),
+        );
+        itransform4(r, lo, hi, dst);
+        (nz, sse16x4(&it.yuv_in[Y_OFF + off..], dst))
+    }
+
+    /// Reconstructs the 16x16 blocks with `mode`, every row.
+    fn reconstruct_intra16(
+        &mut self,
+        dc_levels: &mut [i16; 16],
+        ac_levels: &mut [[i16; 16]; 16],
+        to_out2: bool,
+        mode: usize,
+    ) -> u32 {
+        let mut tmp = [[0i16; 16]; 16];
+        let (mut nz, dcs) = self.transform_intra16(dc_levels, &mut tmp, mode);
+        if self.it.do_trellis {
+            self.nz_to_bytes();
+        }
+        for row in 0..4 {
+            nz |= self
+                .reconstruct_intra16_row(row, &mut tmp, &dcs, ac_levels, to_out2, mode)
+                .0;
         }
         nz
     }
@@ -1392,26 +1439,33 @@ impl<'a> Encoder<'a> {
     // ---------------------------------------------------------------------------------------
     // Rate
 
-    /// The rate of the levels, or a part of it of at least `cap`. Every reader of the
-    /// contexts it leaves imports them again first.
-    fn cost_luma16(&mut self, dc_levels: &[i16; 16], ac_levels: &[[i16; 16]; 16], cap: i32) -> i64 {
-        self.nz_to_bytes();
-        let mut r = Residual::new(0, 1, dc_levels).cost(
-            (self.it.top_nz[8] + self.it.left_nz[8]) as usize,
-            &self.proba,
-        );
-        for y in 0..4 {
-            for x in 0..4 {
-                if r >= cap {
-                    return i64::from(r);
-                }
-                let ctx = (self.it.top_nz[x] + self.it.left_nz[y]) as usize;
-                let res = Residual::new(1, 0, &ac_levels[x + y * 4]);
-                r += res.cost(ctx, &self.proba);
-                let nz = i32::from(res.last >= 0);
-                self.it.top_nz[x] = nz;
-                self.it.left_nz[y] = nz;
+    /// The rate of `row` of the 16x16 levels (row 0 with the DC levels), or a part of it of
+    /// at least `cap`, from the contexts the rows before left. Every later reader of the
+    /// contexts imports them again first.
+    fn cost_luma16_row(
+        &mut self,
+        row: usize,
+        dc_levels: &[i16; 16],
+        ac_levels: &[[i16; 16]; 16],
+        cap: i32,
+    ) -> i64 {
+        let mut r = 0;
+        if row == 0 {
+            r += Residual::new(0, 1, dc_levels).cost(
+                (self.it.top_nz[8] + self.it.left_nz[8]) as usize,
+                &self.proba,
+            );
+        }
+        for x in 0..4 {
+            if r >= cap {
+                return i64::from(r);
             }
+            let ctx = (self.it.top_nz[x] + self.it.left_nz[row]) as usize;
+            let res = Residual::new(1, 0, &ac_levels[x + row * 4]);
+            r += res.cost(ctx, &self.proba);
+            let nz = i32::from(res.last >= 0);
+            self.it.top_nz[x] = nz;
+            self.it.left_nz[row] = nz;
         }
         i64::from(r)
     }
@@ -1467,19 +1521,53 @@ impl<'a> Encoder<'a> {
         let mut best = 0;
         let mut best_score = Score::INIT;
         let mut best_mode = -1;
-        for mode in 0..NUM_PRED_MODES {
+        let mut tmp = [[0i16; 16]; 16];
+        'modes: for mode in 0..NUM_PRED_MODES {
             let slot = if best_mode < 0 { 0 } else { 1 - best };
             let (dc, ac) = &mut levels[slot];
             let mut cur = Score::INIT;
-            cur.nz = self.reconstruct_intra16(dc, ac, true, mode);
-            let src = &self.it.yuv_in[Y_OFF..];
-            let out = &self.it.yuv_out2[Y_OFF..];
-            cur.d = i64::from(sse16x16(src, out));
-            cur.sd = tdisto.as_ref().map_or(0, |t| {
-                i64::from(mult_8b(tlambda, t.disto(src, out, &WEIGHT_Y)))
-            });
             cur.h = i64::from(FIXED_COSTS_I16[mode]);
-            let (dc, ac) = &levels[slot];
+            let (nz, dcs) = self.transform_intra16(dc, &mut tmp, mode);
+            cur.nz = nz;
+            let mut disto = 0;
+            self.nz_to_bytes();
+            // Each row's distortion and rate only add to the score, so a mode whose rows so
+            // far reach the best score loses without the rest. The trellis walks the same
+            // contexts as the rate, so each row's are put back between the two.
+            for row in 0..4 {
+                cur.sd = i64::from(mult_8b(tlambda, disto));
+                let partial =
+                    (cur.r + cur.h) * i64::from(lambda) + RD_DISTO_MULT * (cur.d + cur.sd);
+                if mode > 0 && partial >= best_score.score {
+                    // A flat source's flag follows every mode's levels in turn.
+                    if is_flat {
+                        for rest in row..4 {
+                            self.quantize_intra16_row(rest, &mut tmp, ac);
+                        }
+                        is_flat = is_flat_fn(ac.as_flattened(), 16, FLATNESS_LIMIT_I16);
+                    }
+                    continue 'modes;
+                }
+                let contexts = (self.it.top_nz, self.it.left_nz);
+                let (nz, d) = self.reconstruct_intra16_row(row, &mut tmp, &dcs, ac, true, mode);
+                (self.it.top_nz, self.it.left_nz) = contexts;
+                cur.nz |= nz;
+                cur.d += i64::from(d);
+                if let Some(t) = &tdisto {
+                    let (src, out) = (&self.it.yuv_in[Y_OFF..], &self.it.yuv_out2[Y_OFF..]);
+                    disto += t.disto_row(src, out, &WEIGHT_Y, row);
+                    cur.sd = i64::from(mult_8b(tlambda, disto));
+                }
+                let cap = match mode {
+                    0 => i32::MAX,
+                    _ => rate_cap(
+                        best_score.score,
+                        (cur.r + cur.h) * i64::from(lambda) + RD_DISTO_MULT * (cur.d + cur.sd),
+                        lambda,
+                    ),
+                };
+                cur.r += self.cost_luma16_row(row, dc, ac, cap);
+            }
             if is_flat {
                 is_flat = is_flat_fn(ac.as_flattened(), 16, FLATNESS_LIMIT_I16);
                 if is_flat {
@@ -1487,15 +1575,6 @@ impl<'a> Encoder<'a> {
                     cur.sd *= 2;
                 }
             }
-            let cap = match mode {
-                0 => i32::MAX,
-                _ => rate_cap(
-                    best_score.score,
-                    cur.h * i64::from(lambda) + RD_DISTO_MULT * (cur.d + cur.sd),
-                    lambda,
-                ),
-            };
-            cur.r = self.cost_luma16(dc, ac, cap);
             cur.set_rd_score(lambda);
             if mode == 0 || cur.score < best_score.score {
                 best = slot;

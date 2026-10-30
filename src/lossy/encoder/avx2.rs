@@ -624,7 +624,7 @@ fn tsums_band(a: &[u8], y: usize, w: &[u16; 16]) -> __m256i {
     _mm256_hadd_epi32(h, h)
 }
 
-/// The source half of `tdisto16x16`: `tsums_band` of each band of `a`.
+/// The source half of `TDisto16`: `tsums_band` of each band of `a`.
 #[target_feature(enable = "avx2")]
 pub(crate) fn tsums16x16(a: &[u8], w: &[u16; 16]) -> [[i32; 8]; 4] {
     let a = &a[..15 * BPS + 16];
@@ -635,16 +635,12 @@ pub(crate) fn tsums16x16(a: &[u8], w: &[u16; 16]) -> [[i32; 8]; 4] {
     out
 }
 
-/// `dsp::tdisto16x16` of `b` against the source whose `tsums16x16` are `src`.
+/// `TDisto16::disto_row` of `b`, `src` the row's band of `tsums16x16`.
 #[target_feature(enable = "avx2")]
-pub(crate) fn tdisto16x16(src: &[[i32; 8]; 4], b: &[u8], w: &[u16; 16]) -> i32 {
+pub(crate) fn tdisto16x4(src: &[i32; 8], b: &[u8], w: &[u16; 16], row: usize) -> i32 {
     let b = &b[..15 * BPS + 16];
-    let mut acc = _mm256_setzero_si256();
-    for (y, s) in src.iter().enumerate() {
-        let d = _mm256_sub_epi32(load(s), tsums_band(b, 4 * y, w));
-        acc = _mm256_add_epi32(acc, _mm256_srai_epi32::<5>(_mm256_abs_epi32(d)));
-    }
-    let acc = lanes(acc);
+    let d = _mm256_sub_epi32(load(src), tsums_band(b, 4 * row, w));
+    let acc = lanes(_mm256_srai_epi32::<5>(_mm256_abs_epi32(d)));
     acc[0] + acc[1] + acc[4] + acc[5]
 }
 
@@ -1093,14 +1089,15 @@ mod tests {
             sse2::itransform_two(&b[8..], &coeffs[32..], &mut d2[8..]);
             assert_eq!(d1, d2);
 
-            let mut t = 0;
-            for y in (0..16 * BPS).step_by(4 * BPS) {
-                for x in (0..16).step_by(4) {
-                    t += sse2::ttransform(&a[x + y..], &b[x + y..], &w).abs() >> 5;
-                }
-            }
             let sums = unsafe { super::tsums16x16(&a, &w) };
-            assert_eq!(unsafe { super::tdisto16x16(&sums, &b, &w) }, t);
+            for row in 0..4 {
+                let mut t = 0;
+                for x in (0..16).step_by(4) {
+                    let off = x + row * 4 * BPS;
+                    t += sse2::ttransform(&a[off..], &b[off..], &w).abs() >> 5;
+                }
+                assert_eq!(unsafe { super::tdisto16x4(&sums[row], &b, &w, row) }, t);
+            }
 
             let mut h1 = [[0u16; 32]; 4];
             unsafe { super::histogram_rows(&a, &b, &[0, 4 * BPS, 8 * BPS, 12 * BPS], &mut h1) };
