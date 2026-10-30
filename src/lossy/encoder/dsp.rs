@@ -466,7 +466,8 @@ pub(crate) fn ftransform_wht(input: &[i16], out: &mut [i16; 16]) {
 }
 
 /// Inverse WHT of the decoder, writing the DC of each of the 16 blocks in `out` (16 apart).
-pub(crate) fn transform_wht(input: &[i16; 16], out: &mut [i16]) {
+/// The inverse WHT of the quantized DC levels: the 16 DCs, one per block.
+pub(crate) fn transform_wht_dc(input: &[i16; 16]) -> [i16; 16] {
     let mut tmp = [0i32; 16];
     for i in 0..4 {
         let a0 = i32::from(input[i]) + i32::from(input[12 + i]);
@@ -478,18 +479,19 @@ pub(crate) fn transform_wht(input: &[i16; 16], out: &mut [i16]) {
         tmp[4 + i] = a3 + a2;
         tmp[12 + i] = a3 - a2;
     }
+    let mut out = [0i16; 16];
     for i in 0..4 {
         let dc = tmp[i * 4] + 3;
         let a0 = dc + tmp[3 + i * 4];
         let a1 = tmp[1 + i * 4] + tmp[2 + i * 4];
         let a2 = tmp[1 + i * 4] - tmp[2 + i * 4];
         let a3 = dc - tmp[3 + i * 4];
-        let o = &mut out[i * 64..];
-        o[0] = ((a0 + a1) >> 3) as i16;
-        o[16] = ((a3 + a2) >> 3) as i16;
-        o[32] = ((a0 - a1) >> 3) as i16;
-        o[48] = ((a3 - a2) >> 3) as i16;
+        out[i * 4] = ((a0 + a1) >> 3) as i16;
+        out[i * 4 + 1] = ((a3 + a2) >> 3) as i16;
+        out[i * 4 + 2] = ((a0 - a1) >> 3) as i16;
+        out[i * 4 + 3] = ((a3 - a2) >> 3) as i16;
     }
+    out
 }
 
 #[inline(always)]

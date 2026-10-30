@@ -1135,13 +1135,12 @@ impl<'a> Encoder<'a> {
         let mut dc_tmp = [0i16; 16];
         ftransform_wht(tmp.as_flattened(), &mut dc_tmp);
         let nz = u32::from(quantize_block(&mut dc_tmp, dc_levels, &dqm.y2)) << 24;
-        let mut wht = [0i16; 256];
-        transform_wht(&dc_tmp, &mut wht);
-        (nz, std::array::from_fn(|n| wht[n * 16]))
+        (nz, transform_wht_dc(&dc_tmp))
     }
 
     /// Quantizes the AC levels of `row` (0..4) of the 16x16 blocks in `tmp`, the trellis in
     /// raster order from the contexts the rows before left. Returns the row's non-zero bits.
+    #[inline]
     fn quantize_intra16_row(
         &mut self,
         row: usize,
@@ -1187,6 +1186,7 @@ impl<'a> Encoder<'a> {
 
     /// Reconstructs `row` of the quantized 16x16 blocks in `tmp` into `yuv_out2` or
     /// `yuv_out`, returning its distortion.
+    #[inline]
     fn reconstruct_intra16_row(
         &mut self,
         row: usize,
@@ -1212,6 +1212,7 @@ impl<'a> Encoder<'a> {
     }
 
     /// `quantize_intra16_row` of `row` with the dequantized DCs `dcs` put back after it.
+    #[inline]
     fn quantize_intra16_row_dc(
         &mut self,
         row: usize,
@@ -1395,6 +1396,7 @@ impl<'a> Encoder<'a> {
 
     /// Reconstructs `row` (0 or 1) of the chroma blocks of `transform_uv`, the upper or lower
     /// half of U and V, into `yuv_out2` or `yuv_out`. Returns the row's distortion.
+    #[inline]
     fn reconstruct_uv_row(
         &mut self,
         row: usize,
@@ -1438,6 +1440,7 @@ impl<'a> Encoder<'a> {
     /// The rate of `row` of the 16x16 levels (row 0 with the DC levels), or a part of it
     /// weighing at least `bound` at `lambda`, from the contexts the rows before left. Every
     /// later reader of the contexts imports them again first.
+    #[inline]
     fn cost_luma16_row(
         &mut self,
         row: usize,
@@ -1483,6 +1486,7 @@ impl<'a> Encoder<'a> {
 
     /// As `cost_luma16`, for `row` of the chroma levels; row 0 imports the contexts, row 1
     /// continues from the ones row 0 left.
+    #[inline]
     fn cost_uv_row(
         &mut self,
         row: usize,
