@@ -250,18 +250,6 @@ impl<'a> Residual<'a> {
     }
 }
 
-/// The least rate at which a candidate scoring `rate * lambda + rest` reaches `best`: past it
-/// the candidate cannot win a strict comparison, since every score term is non-negative.
-pub(crate) fn rate_cap(best: i64, rest: i64, lambda: i32) -> i32 {
-    let bound = best - rest;
-    let lambda = i64::from(lambda);
-    match (bound <= 0, lambda > 0) {
-        (true, _) => 0,
-        (false, false) => i32::MAX,
-        (false, true) => ((bound + lambda - 1) / lambda).min(i64::from(i32::MAX)) as i32,
-    }
-}
-
 /// The coded bits of all macroblocks, one bit each, emitted once the final probabilities are
 /// known. libwebp stores each bit with its probability index (16 bits); that index follows from
 /// the bits before it, so `emit_block` walks the token tree again instead.

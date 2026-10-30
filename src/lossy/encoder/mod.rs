@@ -17,7 +17,7 @@ mod sse2;
 mod tables;
 
 use bit_writer::BitWriter;
-use cost::{bit_cost, rate_cap, CostTable, Proba, Residual, TokenBuffer, MAX_VARIABLE_LEVEL};
+use cost::{bit_cost, CostTable, Proba, Residual, TokenBuffer, MAX_VARIABLE_LEVEL};
 use csp::Source;
 use dsp::*;
 use tables::{
@@ -1435,15 +1435,16 @@ impl<'a> Encoder<'a> {
     // ---------------------------------------------------------------------------------------
     // Rate
 
-    /// The rate of `row` of the 16x16 levels (row 0 with the DC levels), or a part of it of
-    /// at least `cap`, from the contexts the rows before left. Every later reader of the
-    /// contexts imports them again first.
+    /// The rate of `row` of the 16x16 levels (row 0 with the DC levels), or a part of it
+    /// weighing at least `bound` at `lambda`, from the contexts the rows before left. Every
+    /// later reader of the contexts imports them again first.
     fn cost_luma16_row(
         &mut self,
         row: usize,
         dc_levels: &[i16; 16],
         ac_levels: &[[i16; 16]; 16],
-        cap: i32,
+        bound: i64,
+        lambda: i64,
     ) -> i64 {
         let mut r = 0;
         if row == 0 {
@@ -1453,7 +1454,7 @@ impl<'a> Encoder<'a> {
             );
         }
         for x in 0..4 {
-            if r >= cap {
+            if i64::from(r) * lambda >= bound {
                 return i64::from(r);
             }
             let ctx = (self.it.top_nz[x] + self.it.left_nz[row]) as usize;
@@ -1482,14 +1483,20 @@ impl<'a> Encoder<'a> {
 
     /// As `cost_luma16`, for `row` of the chroma levels; row 0 imports the contexts, row 1
     /// continues from the ones row 0 left.
-    fn cost_uv_row(&mut self, row: usize, uv_levels: &[[i16; 16]; 8], cap: i32) -> i64 {
+    fn cost_uv_row(
+        &mut self,
+        row: usize,
+        uv_levels: &[[i16; 16]; 8],
+        bound: i64,
+        lambda: i64,
+    ) -> i64 {
         if row == 0 {
             self.nz_to_bytes();
         }
         let mut r = 0;
         for ch in [0, 2] {
             for x in 0..2 {
-                if r >= cap {
+                if i64::from(r) * lambda >= bound {
                     return i64::from(r);
                 }
                 let ctx = (self.it.top_nz[4 + ch + x] + self.it.left_nz[4 + ch + row]) as usize;
@@ -1548,15 +1555,16 @@ impl<'a> Encoder<'a> {
                     (self.it.top_nz, self.it.left_nz) = contexts;
                 }
                 cur.d += i64::from(self.reconstruct_intra16_row(row, &tmp, true, mode));
-                let cap = match mode {
-                    0 => i32::MAX,
-                    _ => rate_cap(
-                        best_score.score,
-                        (cur.r + cur.h) * i64::from(lambda) + RD_DISTO_MULT * cur.d,
-                        lambda,
-                    ),
+                // The rate past which the mode loses: a row's rate stops there.
+                let bound = match mode {
+                    0 => i64::MAX,
+                    _ => {
+                        best_score.score
+                            - (cur.r + cur.h) * i64::from(lambda)
+                            - RD_DISTO_MULT * cur.d
+                    }
                 };
-                cur.r += self.cost_luma16_row(row, dc, ac, cap);
+                cur.r += self.cost_luma16_row(row, dc, ac, bound, i64::from(lambda));
                 rows += 1;
             }
             if rows < 4 {
@@ -1808,15 +1816,11 @@ impl<'a> Encoder<'a> {
                 }
                 let d = self.reconstruct_uv_row(row, &tmp, tmp_is_out2, mode);
                 rd_uv.d += i64::from(d);
-                let cap = match mode {
-                    0 => i32::MAX,
-                    _ => rate_cap(
-                        rd_best.score,
-                        partial + RD_DISTO_MULT * i64::from(d),
-                        lambda,
-                    ),
+                let bound = match mode {
+                    0 => i64::MAX,
+                    _ => rd_best.score - partial - RD_DISTO_MULT * i64::from(d),
                 };
-                rd_uv.r += self.cost_uv_row(row, uv_levels, cap);
+                rd_uv.r += self.cost_uv_row(row, uv_levels, bound, i64::from(lambda));
             }
             rd_uv.sd = 0;
             if mode > 0 && is_flat_fn(uv_levels.as_flattened(), 8, FLATNESS_LIMIT_UV) {
