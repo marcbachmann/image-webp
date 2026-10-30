@@ -965,8 +965,18 @@ fn tdisto4x4_portable(a: &[u8], b: &[u8], w: &[u16; 16]) -> i32 {
     (sb - sa).abs() >> 5
 }
 
-/// The weighted transform distortion of a 16x16 block against one source macroblock, by rows
-/// of 4x4 blocks; with AVX2 the source's half of the transform is done once.
+pub(crate) fn tdisto16x16(a: &[u8], b: &[u8], w: &[u16; 16]) -> i32 {
+    let mut d = 0;
+    for y in (0..16 * BPS).step_by(4 * BPS) {
+        for x in (0..16).step_by(4) {
+            d += tdisto4x4(&a[x + y..], &b[x + y..], w);
+        }
+    }
+    d
+}
+
+/// `tdisto16x16` against one source macroblock, with AVX2 its half of the transform done
+/// once.
 pub(crate) struct TDisto16 {
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     sums: Option<[[i32; 8]; 4]>,
@@ -985,19 +995,15 @@ impl TDisto16 {
         Self { sums: None }
     }
 
-    /// `tdisto4x4` summed over `row` (0..4) of 4x4 blocks of `b` against `src`, the source of `new`.
+    /// `tdisto16x16(src, b, w)`, `src` and `w` those of `new`.
     #[allow(unsafe_code)]
-    pub(crate) fn disto_row(&self, src: &[u8], b: &[u8], w: &[u16; 16], row: usize) -> i32 {
+    pub(crate) fn disto(&self, src: &[u8], b: &[u8], w: &[u16; 16]) -> i32 {
         #[cfg(target_arch = "x86_64")]
         if let Some(sums) = &self.sums {
             // SAFETY: `sums` exists only when the CPU supports AVX2.
-            return unsafe { super::avx2::tdisto16x4(&sums[row], b, w, row) };
+            return unsafe { super::avx2::tdisto16x16(sums, b, w) };
         }
-        let off = row * 4 * BPS;
-        (0..16)
-            .step_by(4)
-            .map(|x| tdisto4x4(&src[x + off..], &b[x + off..], w))
-            .sum()
+        tdisto16x16(src, b, w)
     }
 }
 
