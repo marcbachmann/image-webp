@@ -1259,7 +1259,16 @@ impl<'a> Encoder<'a> {
         (if sign { -value } else { value }) >> DSCALE
     }
 
-    fn correct_dc_values(&self, mtx: &Matrix, tmp: &mut [[i16; 16]; 8], derr: &mut [[i8; 3]; 2]) {
+    /// The DC error diffusion of `row` of the chroma blocks: the errors of row 0 feed row 1
+    /// through `errs`, and row 1 leaves `derr` for the blocks below and to the right.
+    fn correct_dc_row(
+        &self,
+        mtx: &Matrix,
+        row: usize,
+        tmp: &mut [[i16; 16]; 8],
+        derr: &mut [[i8; 3]; 2],
+        errs: &mut [[i32; 2]; 2],
+    ) {
         const C1: i32 = 7;
         const C2: i32 = 8;
         const DSHIFT: i32 = 4;
@@ -1269,21 +1278,30 @@ impl<'a> Encoder<'a> {
             let top = top_derr[self.it.x][ch];
             let left = self.it.left_derr[ch];
             let c = &mut tmp[ch * 4..ch * 4 + 4];
-            c[0][0] = c[0][0].wrapping_add(
-                ((C1 * i32::from(top[0]) + C2 * i32::from(left[0])) >> (DSHIFT - DSCALE)) as i16,
-            );
-            let err0 = Self::quantize_single(&mut c[0][0], mtx);
-            c[1][0] = c[1][0]
-                .wrapping_add(((C1 * i32::from(top[1]) + C2 * err0) >> (DSHIFT - DSCALE)) as i16);
-            let err1 = Self::quantize_single(&mut c[1][0], mtx);
-            c[2][0] = c[2][0]
-                .wrapping_add(((C1 * err0 + C2 * i32::from(left[1])) >> (DSHIFT - DSCALE)) as i16);
-            let err2 = Self::quantize_single(&mut c[2][0], mtx);
-            c[3][0] = c[3][0].wrapping_add(((C1 * err1 + C2 * err2) >> (DSHIFT - DSCALE)) as i16);
-            let err3 = Self::quantize_single(&mut c[3][0], mtx);
-            derr[ch][0] = err1 as i8;
-            derr[ch][1] = err2 as i8;
-            derr[ch][2] = err3 as i8;
+            if row == 0 {
+                c[0][0] = c[0][0].wrapping_add(
+                    ((C1 * i32::from(top[0]) + C2 * i32::from(left[0])) >> (DSHIFT - DSCALE))
+                        as i16,
+                );
+                let err0 = Self::quantize_single(&mut c[0][0], mtx);
+                c[1][0] = c[1][0].wrapping_add(
+                    ((C1 * i32::from(top[1]) + C2 * err0) >> (DSHIFT - DSCALE)) as i16,
+                );
+                let err1 = Self::quantize_single(&mut c[1][0], mtx);
+                errs[ch] = [err0, err1];
+            } else {
+                let [err0, err1] = errs[ch];
+                c[2][0] = c[2][0].wrapping_add(
+                    ((C1 * err0 + C2 * i32::from(left[1])) >> (DSHIFT - DSCALE)) as i16,
+                );
+                let err2 = Self::quantize_single(&mut c[2][0], mtx);
+                c[3][0] =
+                    c[3][0].wrapping_add(((C1 * err1 + C2 * err2) >> (DSHIFT - DSCALE)) as i16);
+                let err3 = Self::quantize_single(&mut c[3][0], mtx);
+                derr[ch][0] = err1 as i8;
+                derr[ch][1] = err2 as i8;
+                derr[ch][2] = err3 as i8;
+            }
         }
     }
 
@@ -1300,6 +1318,59 @@ impl<'a> Encoder<'a> {
         }
     }
 
+    /// Reconstructs `row` (0 or 1) of the chroma blocks with `mode`, the upper or lower half
+    /// of U and V: `tmp` and `uv_levels` take the row's blocks, and the rows must come in
+    /// order for the DC error diffusion. Returns the row's non-zero bits and its distortion.
+    #[allow(clippy::too_many_arguments)]
+    fn reconstruct_uv_row(
+        &mut self,
+        row: usize,
+        tmp: &mut [[i16; 16]; 8],
+        uv_levels: &mut [[i16; 16]; 8],
+        derr: &mut [[i8; 3]; 2],
+        errs: &mut [[i32; 2]; 2],
+        to_out2: bool,
+        mode: usize,
+    ) -> (u32, i32) {
+        let seg = self.mb().segment as usize;
+        let off = row * 4 * BPS;
+        let (u, v) = (row * 2, 4 + row * 2);
+        {
+            let r = &self.it.yuv_p[UV_MODE_OFFSETS[mode] + off..];
+            let src = &self.it.yuv_in[U_OFF + off..];
+            let (top, bottom) = tmp.split_at_mut(4);
+            ftransform4(
+                src,
+                r,
+                top[u..u + 2].as_flattened_mut(),
+                bottom[u..u + 2].as_flattened_mut(),
+            );
+        }
+        let uv = &self.dqm[seg].uv;
+        if self.top_derr.is_some() {
+            self.correct_dc_row(uv, row, tmp, derr, errs);
+        }
+        let mut nz = 0u32;
+        for n in [u, v] {
+            nz |= quantize2_blocks(
+                tmp[n..n + 2].as_flattened_mut(),
+                uv_levels[n..n + 2].as_flattened_mut(),
+                uv,
+            ) << n;
+        }
+        let it = &mut self.it;
+        let r = &it.yuv_p[UV_MODE_OFFSETS[mode] + off..];
+        let dst = if to_out2 {
+            &mut it.yuv_out2[U_OFF + off..]
+        } else {
+            &mut it.yuv_out[U_OFF + off..]
+        };
+        let (u, v) = (tmp[u..u + 2].as_flattened(), tmp[v..v + 2].as_flattened());
+        itransform4(r, u, v, dst);
+        (nz << 16, sse16x4(&it.yuv_in[U_OFF + off..], dst))
+    }
+
+    /// Reconstructs the chroma blocks with `mode`, both rows.
     fn reconstruct_uv(
         &mut self,
         uv_levels: &mut [[i16; 16]; 8],
@@ -1307,74 +1378,15 @@ impl<'a> Encoder<'a> {
         to_out2: bool,
         mode: usize,
     ) -> u32 {
-        let seg = self.mb().segment as usize;
-        let mut nz = 0u32;
         let mut tmp = [[0i16; 16]; 8];
-        {
-            let r = &self.it.yuv_p[UV_MODE_OFFSETS[mode]..];
-            let src = &self.it.yuv_in[U_OFF..];
-            let (top, bottom) = tmp.split_at_mut(4);
-            let (u0, u1) = top.split_at_mut(2);
-            let (v0, v1) = bottom.split_at_mut(2);
-            ftransform4(src, r, u0.as_flattened_mut(), v0.as_flattened_mut());
-            ftransform4(
-                &src[4 * BPS..],
-                &r[4 * BPS..],
-                u1.as_flattened_mut(),
-                v1.as_flattened_mut(),
-            );
+        let mut errs = [[0i32; 2]; 2];
+        let mut nz = 0;
+        for row in 0..2 {
+            nz |= self
+                .reconstruct_uv_row(row, &mut tmp, uv_levels, derr, &mut errs, to_out2, mode)
+                .0;
         }
-        let dqm = &self.dqm[seg];
-        let uv = &dqm.uv;
-        if self.top_derr.is_some() {
-            self.correct_dc_values(uv, &mut tmp, derr);
-        }
-        const DO_TRELLIS_UV: bool = false;
-        if DO_TRELLIS_UV && self.it.do_trellis {
-            let mut n = 0;
-            for ch in [0, 2] {
-                for y in 0..2 {
-                    for x in 0..2 {
-                        let ctx =
-                            (self.it.top_nz[4 + ch + x] + self.it.left_nz[4 + ch + y]) as usize;
-                        let non_zero = trellis_quantize_block(
-                            &self.proba,
-                            &mut tmp[n],
-                            &mut uv_levels[n],
-                            ctx,
-                            2,
-                            uv,
-                            dqm.lambda_trellis_uv,
-                        );
-                        self.it.top_nz[4 + ch + x] = i32::from(non_zero);
-                        self.it.left_nz[4 + ch + y] = i32::from(non_zero);
-                        nz |= u32::from(non_zero) << n;
-                        n += 1;
-                    }
-                }
-            }
-        } else {
-            for n in (0..8).step_by(2) {
-                nz |= quantize2_blocks(
-                    tmp[n..n + 2].as_flattened_mut(),
-                    uv_levels[n..n + 2].as_flattened_mut(),
-                    uv,
-                ) << n;
-            }
-        }
-        let it = &mut self.it;
-        let r = &it.yuv_p[UV_MODE_OFFSETS[mode]..];
-        let dst = if to_out2 {
-            &mut it.yuv_out2[..]
-        } else {
-            &mut it.yuv_out[..]
-        };
-        for (y, (u, v)) in [(0, 4), (2, 6)].into_iter().enumerate() {
-            let off = y * 4 * BPS;
-            let (u, v) = (tmp[u..u + 2].as_flattened(), tmp[v..v + 2].as_flattened());
-            itransform4(&r[off..], u, v, &mut dst[U_OFF + off..]);
-        }
-        nz << 16
+        nz
     }
 
     // ---------------------------------------------------------------------------------------
@@ -1418,23 +1430,24 @@ impl<'a> Encoder<'a> {
         i64::from(res.cost(ctx, &self.proba))
     }
 
-    /// As `cost_luma16`, for the chroma levels.
-    fn cost_uv(&mut self, uv_levels: &[[i16; 16]; 8], cap: i32) -> i64 {
-        self.nz_to_bytes();
+    /// As `cost_luma16`, for `row` of the chroma levels; row 0 imports the contexts, row 1
+    /// continues from the ones row 0 left.
+    fn cost_uv_row(&mut self, row: usize, uv_levels: &[[i16; 16]; 8], cap: i32) -> i64 {
+        if row == 0 {
+            self.nz_to_bytes();
+        }
         let mut r = 0;
         for ch in [0, 2] {
-            for y in 0..2 {
-                for x in 0..2 {
-                    if r >= cap {
-                        return i64::from(r);
-                    }
-                    let ctx = (self.it.top_nz[4 + ch + x] + self.it.left_nz[4 + ch + y]) as usize;
-                    let res = Residual::new(0, 2, &uv_levels[ch * 2 + x + y * 2]);
-                    r += res.cost(ctx, &self.proba);
-                    let nz = i32::from(res.last >= 0);
-                    self.it.top_nz[4 + ch + x] = nz;
-                    self.it.left_nz[4 + ch + y] = nz;
+            for x in 0..2 {
+                if r >= cap {
+                    return i64::from(r);
                 }
+                let ctx = (self.it.top_nz[4 + ch + x] + self.it.left_nz[4 + ch + row]) as usize;
+                let res = Residual::new(0, 2, &uv_levels[ch * 2 + x + row * 2]);
+                r += res.cost(ctx, &self.proba);
+                let nz = i32::from(res.last >= 0);
+                self.it.top_nz[4 + ch + x] = nz;
+                self.it.left_nz[4 + ch + row] = nz;
             }
         }
         i64::from(r)
@@ -1693,32 +1706,45 @@ impl<'a> Encoder<'a> {
         let mut best = 0;
 
         rd.mode_uv = -1;
-        for mode in 0..NUM_PRED_MODES {
+        'modes: for mode in 0..NUM_PRED_MODES {
             let slot = if rd.mode_uv < 0 { 0 } else { 1 - best };
             let (uv_levels, derr) = &mut levels[slot];
             let mut rd_uv = Score::INIT;
-            rd_uv.nz = self.reconstruct_uv(uv_levels, derr, tmp_is_out2, mode);
-            let src = &self.it.yuv_in[U_OFF..];
-            let dst = if tmp_is_out2 {
-                &self.it.yuv_out2[U_OFF..]
-            } else {
-                &self.it.yuv_out[U_OFF..]
-            };
-            rd_uv.d = i64::from(sse16x8(src, dst));
-            rd_uv.sd = 0;
             rd_uv.h = i64::from(FIXED_COSTS_UV[mode]);
-            let uv_levels = &levels[slot].0;
-            if mode > 0 && is_flat_fn(uv_levels.as_flattened(), 8, FLATNESS_LIMIT_UV) {
-                rd_uv.r = FLATNESS_PENALTY * 8;
-            }
-            let cap = match mode {
-                0 => i32::MAX,
-                _ => {
-                    rd_uv.set_rd_score(lambda);
-                    rate_cap(rd_best.score, rd_uv.score, lambda)
+            let mut tmp = [[0i16; 16]; 8];
+            let mut errs = [[0i32; 2]; 2];
+            // Each row's distortion and rate only add to the score, so a mode whose first row
+            // already reaches the best score loses without its second.
+            for row in 0..2 {
+                let partial = (rd_uv.r + rd_uv.h) * i64::from(lambda) + RD_DISTO_MULT * rd_uv.d;
+                if mode > 0 && partial >= rd_best.score {
+                    continue 'modes;
                 }
-            };
-            rd_uv.r += self.cost_uv(uv_levels, cap);
+                let (nz, d) = self.reconstruct_uv_row(
+                    row,
+                    &mut tmp,
+                    uv_levels,
+                    derr,
+                    &mut errs,
+                    tmp_is_out2,
+                    mode,
+                );
+                rd_uv.nz |= nz;
+                rd_uv.d += i64::from(d);
+                let cap = match mode {
+                    0 => i32::MAX,
+                    _ => rate_cap(
+                        rd_best.score,
+                        partial + RD_DISTO_MULT * i64::from(d),
+                        lambda,
+                    ),
+                };
+                rd_uv.r += self.cost_uv_row(row, uv_levels, cap);
+            }
+            rd_uv.sd = 0;
+            if mode > 0 && is_flat_fn(uv_levels.as_flattened(), 8, FLATNESS_LIMIT_UV) {
+                rd_uv.r += FLATNESS_PENALTY * 8;
+            }
             rd_uv.set_rd_score(lambda);
             if mode == 0 || rd_uv.score < rd_best.score {
                 rd_best = rd_uv;

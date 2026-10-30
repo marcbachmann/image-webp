@@ -861,6 +861,22 @@ fn sse16x8_portable(a: &[u8], b: &[u8]) -> i32 {
 }
 
 #[inline]
+pub(crate) fn sse16x4(a: &[u8], b: &[u8]) -> i32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        super::sse2::sse16xn(a, b, 4)
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        super::neon::sse16xn(a, b, 4)
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        sse::<16>(a, b, 4)
+    }
+}
+
+#[inline]
 pub(crate) fn sse4x4(a: &[u8], b: &[u8]) -> i32 {
     #[cfg(target_arch = "x86_64")]
     {
