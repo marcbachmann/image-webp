@@ -2,6 +2,27 @@
 
 use super::tables::{NEW_RANGE, NORM};
 
+/// `NORM` and `NEW_RANGE` over every range the coder holds (at most 254): no shift and the
+/// range itself from 127 up, where libwebp does not renormalise.
+const SHIFT: [u8; 255] = full(NORM, true);
+const RANGE: [u8; 255] = full(NEW_RANGE, false);
+
+const fn full(table: [u8; 128], shift: bool) -> [u8; 255] {
+    let mut out = [0u8; 255];
+    let mut r = 0;
+    while r < 255 {
+        out[r] = if r < 127 {
+            table[r]
+        } else if shift {
+            0
+        } else {
+            r as u8
+        };
+        r += 1;
+    }
+    out
+}
+
 pub(crate) struct BitWriter {
     range: i32,
     value: i32,
@@ -45,23 +66,20 @@ impl BitWriter {
         }
     }
 
+    /// `VP8PutBit`, without a branch on the bit or on the renormalisation: level and sign
+    /// bits are coin flips, so a branch on them mispredicts about every other token.
     #[inline]
     pub(crate) fn put_bit(&mut self, bit: bool, prob: u8) -> bool {
         let split = (self.range * i32::from(prob)) >> 8;
-        if bit {
-            self.value += split + 1;
-            self.range -= split + 1;
-        } else {
-            self.range = split;
-        }
-        if self.range < 127 {
-            let shift = NORM[(self.range & 127) as usize];
-            self.range = i32::from(NEW_RANGE[(self.range & 127) as usize]);
-            self.value <<= shift;
-            self.nb_bits += i32::from(shift);
-            if self.nb_bits > 0 {
-                self.flush();
-            }
+        let mask = -(bit as i32);
+        self.value += (split + 1) & mask;
+        let range = (split & !mask) | ((self.range - split - 1) & mask);
+        let shift = SHIFT[range as usize];
+        self.range = i32::from(RANGE[range as usize]);
+        self.value <<= shift;
+        self.nb_bits += i32::from(shift);
+        if self.nb_bits > 0 {
+            self.flush();
         }
         bit
     }
