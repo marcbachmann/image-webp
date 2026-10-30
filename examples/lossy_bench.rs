@@ -1,14 +1,38 @@
-//! Encodes a large image built by tiling an RGB or RGBA PNG, with image-webp or libwebp, for timing and
+//! Encodes an RGB or RGBA PNG at a chosen size, with image-webp or libwebp, for timing and
 //! peak-memory measurement (`/usr/bin/time -v` / `-l`).
 //!
 //! cargo run --release --example lossy_bench -- ours|ours-rows|libwebp in.png [WxH] [quality] [method] [reps]
 //!
+//! A side smaller than the PNG's is box-averaged down to it, a larger one mirror-tiles the
+//! picture so that every pixel stays real; no size is the PNG's own.
 //! `ours-rows` generates the rows as the encoder asks for them, without the whole image.
 
 use std::time::Instant;
 
 use image_webp::{ColorType, EncoderParams, WebPEncoder};
 use libwebp_sys as sys;
+
+/// `src` (`sw`x`sh`, `bpp` bytes a pixel) averaged down to `dw`x`dh`: each output pixel is
+/// the mean of the source pixels its box covers, the boxes at least one pixel each way.
+fn box_down(src: &[u8], sw: usize, sh: usize, bpp: usize, dw: usize, dh: usize) -> Vec<u8> {
+    let span = |i: usize, n: usize, sn: usize| (i * sn / n, ((i + 1) * sn / n).max(i * sn / n + 1));
+    let mut out = vec![0u8; dw * dh * bpp];
+    for y in 0..dh {
+        let (y0, y1) = span(y, dh, sh);
+        for x in 0..dw {
+            let (x0, x1) = span(x, dw, sw);
+            let count = ((y1 - y0) * (x1 - x0)) as u32;
+            for c in 0..bpp {
+                let sum: u32 = (y0..y1)
+                    .flat_map(|sy| (x0..x1).map(move |sx| (sy, sx)))
+                    .map(|(sy, sx)| u32::from(src[(sy * sw + sx) * bpp + c]))
+                    .sum();
+                out[(y * dw + x) * bpp + c] = ((sum + count / 2) / count) as u8;
+            }
+        }
+    }
+    out
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -27,18 +51,23 @@ fn main() {
     } else {
         ColorType::Rgb8
     };
-    let (sw, sh) = (info.width as usize, info.height as usize);
-    let (w, h) = args
-        .get(3)
-        .map(|s| {
-            s.split_once('x')
-                .map(|(a, b)| (a.parse().unwrap(), b.parse().unwrap()))
-                .unwrap()
-        })
-        .unwrap_or((6000usize, 4000usize));
-    let quality: u8 = args.get(4).map_or(80, |q| q.parse().unwrap());
-    let method: u8 = args.get(5).map_or(4, |m| m.parse().unwrap());
-    let reps: usize = args.get(6).map_or(1, |r| r.parse().unwrap());
+    let (mut sw, mut sh) = (info.width as usize, info.height as usize);
+    let mut rest = &args[3..];
+    let (w, h) = match rest.first().and_then(|s| s.split_once('x')) {
+        Some((a, b)) => {
+            rest = &rest[1..];
+            (a.parse().unwrap(), b.parse().unwrap())
+        }
+        None => (sw, sh),
+    };
+    if w < sw || h < sh {
+        let (dw, dh) = (w.min(sw), h.min(sh));
+        buf = box_down(&buf, sw, sh, bpp, dw, dh);
+        (sw, sh) = (dw, dh);
+    }
+    let quality: u8 = rest.first().map_or(80, |q| q.parse().unwrap());
+    let method: u8 = rest.get(1).map_or(4, |m| m.parse().unwrap());
+    let reps: usize = rest.get(2).map_or(1, |r| r.parse().unwrap());
 
     // Mirror-tile so that tile edges stay continuous.
     let tile_row = |y: usize, row: &mut [u8]| {
