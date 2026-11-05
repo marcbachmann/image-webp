@@ -94,6 +94,10 @@ pub(crate) struct FastMode {
     pub(crate) no_trace: bool,
     /// No colour cache, so no search over its sizes (libwebp has none below quality 26).
     pub(crate) no_cache: bool,
+    /// The predictor search tries four modes (left, top, select, gradient), not 14.
+    pub(crate) pred_subset: bool,
+    /// One predictor for every tile with no search, as libwebp's method 0.
+    pub(crate) pred_single: bool,
 }
 
 impl FastMode {
@@ -106,6 +110,8 @@ impl FastMode {
                 short_chain: set.contains("chain"),
                 no_trace: set.contains("trace"),
                 no_cache: set.contains("cache"),
+                pred_subset: set.contains("subset"),
+                pred_single: set.contains("single"),
             };
         }
         Self {
@@ -113,6 +119,8 @@ impl FastMode {
             short_chain: on && method != 0,
             no_trace: false,
             no_cache: false,
+            pred_subset: false,
+            pred_single: false,
         }
     }
 }
@@ -620,6 +628,11 @@ impl Encoder {
             exact: self.config.exact,
             max_quantization: near_lossless::max_quantization(strength),
             subtract_green: used_subtract_green,
+            modes: if self.config.fast.pred_subset {
+                predictor::SUBSET_MODES
+            } else {
+                predictor::ALL_MODES
+            },
         };
         let n = self.transform_data_len(width, height);
         self.transform_data.clear();
@@ -629,7 +642,7 @@ impl Encoder {
             height as usize,
             min_bits,
             max_bits,
-            low_effort,
+            low_effort || self.config.fast.pred_single,
             &mut self.argb,
             &mut self.transform_data,
             res,

@@ -406,7 +406,14 @@ pub(crate) struct Residuals {
     pub(crate) exact: bool,
     pub(crate) max_quantization: u32,
     pub(crate) subtract_green: bool,
+    /// The predictor modes the search tries, a bit per mode; libwebp tries all 14.
+    pub(crate) modes: u16,
 }
+
+/// Every predictor mode.
+pub(crate) const ALL_MODES: u16 = (1 << NUM_PRED_MODES) - 1;
+/// Left, top, select and the gradient: the `pred_subset` shortcut's four.
+pub(crate) const SUBSET_MODES: u16 = 1 << 1 | 1 << 2 | 1 << 11 | 1 << 12;
 
 struct Scratch {
     rows: Vec<u32>,
@@ -465,7 +472,7 @@ fn compute_residuals_for_tile(
     residuals.resize(max_x * max_y, 0);
     let mut max_diffs = core::mem::take(&mut scratch.max_diffs);
     scratch.swapped = false;
-    for mode in 0..NUM_PRED_MODES {
+    for mode in (0..NUM_PRED_MODES).filter(|m| res.modes >> m & 1 != 0) {
         if start_y > 0 {
             let n = max_x + have_left + 1;
             let src = (start_y - 1) * width + context_start_x;
@@ -698,6 +705,7 @@ fn get_best_predictors_and_sub_sampling(
                 &mut all_accumulated[subsampling_index],
                 all_modes,
                 &mut all_pred_histos,
+                res.modes,
             );
             if subsampling_index == max_subsampling_index {
                 break;
@@ -784,6 +792,7 @@ fn get_best_predictor_for_tile(
     accumulated: &mut [SlogHisto; 4],
     all_modes: &mut [Vec<u32>],
     all_pred_histos: &mut [u32],
+    try_modes: u16,
 ) {
     let modes = &mut all_modes[subsampling_index];
     let left_mode = if tile_x > 0 {
@@ -798,7 +807,7 @@ fn get_best_predictor_for_tile(
     };
     let mut best_diff = i64::MAX;
     let mut best_mode = 0usize;
-    for mode in 0..NUM_PRED_MODES {
+    for mode in (0..NUM_PRED_MODES).filter(|m| try_modes >> m & 1 != 0) {
         let off = (subsampling_index * NUM_PRED_MODES + mode) * HISTO_SIZE;
         let histo = &all_argb[off..off + HISTO_SIZE];
         let cur_diff =
