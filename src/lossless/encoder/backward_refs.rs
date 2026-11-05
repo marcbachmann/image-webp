@@ -722,16 +722,13 @@ pub(crate) struct RefsSet {
 
 /// `VP8LGetBackwardReferences`: fills `refs.best` (and `refs.no_cache` when `do_no_cache`)
 /// and returns the best cache bits.
-pub(crate) fn m0_rle() -> bool {
-    std::env::var_os("IMAGE_WEBP_M0_RLE").is_some()
-}
-
 pub(crate) fn get_backward_references(
     width: u32,
     height: u32,
     argb: &[u32],
     quality: i32,
     low_effort: bool,
+    fast: bool,
     mut lz77_types_to_try: u32,
     cache_bits_max: u32,
     do_no_cache: bool,
@@ -739,7 +736,7 @@ pub(crate) fn get_backward_references(
     refs: &mut RefsSet,
 ) -> u32 {
     if low_effort {
-        if m0_rle() {
+        if fast {
             backward_references_rle(width, height, argb, 0, &mut refs.best);
         } else {
             backward_references_lz77(width, height, argb, 0, hash_chain, &mut refs.best);

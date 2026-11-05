@@ -1065,6 +1065,7 @@ fn encode_lossless(params: &EncoderParams, argb: Vec<u32>, width: u32, height: u
         exact: params.lossless_exact,
         use_predictor: params.use_predictor_transform,
         near_lossless: i32::from(params.near_lossless.min(100)),
+        fast: params.lossless_fast,
     };
     let payload = lossless::encoder::encode_argb(config, argb, width, height);
     let has_alpha = payload[4] & 0x10 != 0;

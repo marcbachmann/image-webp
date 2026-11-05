@@ -56,7 +56,7 @@ fn libwebp_lossless(
 
 fn main() {
     let (mut q, mut m, mut n, mut alpha, mut file) = (75u8, 4u8, 1, false, String::new());
-    let (mut plane, mut lib) = (false, false);
+    let (mut plane, mut lib, mut fast) = (false, false, false);
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -66,6 +66,7 @@ fn main() {
             "--alpha" => alpha = true,
             "--plane" => (alpha, plane) = (true, true),
             "--libwebp" => lib = true,
+            "--fast" => fast = true,
             _ => file = arg,
         }
     }
@@ -122,6 +123,7 @@ fn main() {
             let mut p = EncoderParams::default();
             p.lossless_quality = q;
             p.lossless_method = m;
+            p.lossless_fast = fast;
             enc.set_params(p);
             enc.encode(&px, w, h, color).unwrap();
             out.len()

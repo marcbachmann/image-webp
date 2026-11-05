@@ -74,6 +74,8 @@ pub(crate) struct Config {
     pub(crate) use_predictor: bool,
     /// Near-lossless level 0..=100, 100 for none.
     pub(crate) near_lossless: i32,
+    /// Method 0 with run-length references only and no hash chain; not libwebp's bitstream.
+    pub(crate) fast: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -523,6 +525,7 @@ impl Encoder {
                 height,
                 quality,
                 low_effort,
+                self.config.fast,
                 config,
                 cache_bits,
                 self.histo_bits,
@@ -958,6 +961,7 @@ fn encode_image_no_huffman(
         argb,
         quality,
         false,
+        false,
         LZ77_STANDARD | LZ77_RLE,
         0,
         false,
@@ -985,6 +989,7 @@ fn encode_image_internal(
     height: u32,
     quality: i32,
     low_effort: bool,
+    fast: bool,
     config: &CrunchConfig,
     cache_bits: u32,
     histogram_bits_in: u32,
@@ -993,7 +998,7 @@ fn encode_image_internal(
         * sub_sample_size(height, histogram_bits_in)) as usize;
     let mut histogram_argb = vec![0u32; xysize];
     let mut hash_chain_histogram = HashChain::default();
-    if !(low_effort && backward_refs::m0_rle()) {
+    if !fast {
         hash_chain.fill(quality, argb, width, height, low_effort);
     }
     let cache_bits_init = if cache_bits == 0 {
@@ -1010,6 +1015,7 @@ fn encode_image_internal(
             argb,
             quality,
             low_effort,
+            fast,
             sub_config.lz77,
             cache_bits_init,
             sub_config.do_no_cache,
@@ -1127,7 +1133,10 @@ fn encode_stream<P: Pixel>(
 }
 
 /// `VP8LEncodeImage` minus the RIFF header: the `VP8L` chunk payload of an ARGB image.
-pub(crate) fn encode_argb(config: Config, mut argb: Vec<u32>, width: u32, height: u32) -> Vec<u8> {
+pub(crate) fn encode_argb(mut config: Config, mut argb: Vec<u32>, width: u32, height: u32) -> Vec<u8> {
+    if config.fast {
+        config.method = 0;
+    }
     if !config.exact {
         for p in argb.iter_mut() {
             if *p >> 24 == 0 {
@@ -1210,6 +1219,7 @@ fn encode_green<P: Pixel>(
         exact: true,
         use_predictor: true,
         near_lossless: 100,
+        fast: false,
     };
     let mut bw = BitWriter::with_capacity(pic.len() >> 3);
     encode_stream(config, pic, width, height, &mut bw);
