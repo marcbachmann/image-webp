@@ -931,10 +931,12 @@ fn store_image_to_bit_mask(
                 let tr = literals[1][((p >> 16) & 0xff) as usize];
                 let tb = literals[2][(p & 0xff) as usize];
                 let ta = literals[3][(p >> 24) as usize];
-                let (gl, rl) = (tg >> 16, tr >> 16);
-                bw.put_bits((tg & 0xffff) | (tr & 0xffff) << gl, gl + rl);
-                let (bl, al) = (tb >> 16, ta >> 16);
-                bw.put_bits((tb & 0xffff) | (ta & 0xffff) << bl, bl + al);
+                let (gl, rl, bl, al) = (tg >> 16, tr >> 16, tb >> 16, ta >> 16);
+                let v = u64::from(tg & 0xffff)
+                    | u64::from(tr & 0xffff) << gl
+                    | u64::from(tb & 0xffff) << (gl + rl)
+                    | u64::from(ta & 0xffff) << (gl + rl + bl);
+                bw.put_bits64(v, gl + rl + bl + al);
             }
             PixOrCopyMode::CacheIdx => {
                 write_huffman_code(
