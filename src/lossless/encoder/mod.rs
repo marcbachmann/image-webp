@@ -894,10 +894,24 @@ fn store_image_to_bit_mask(
     } else {
         !((1u32 << histo_bits) - 1)
     };
+    // A literal's four codes and lengths as one word each, in order green, red, blue, alpha.
+    let literal_tables: Vec<[[u32; 256]; 4]> = huffman_codes
+        .chunks_exact(5)
+        .map(|c| {
+            let mut t = [[0u32; 256]; 4];
+            for (k, code) in c[..4].iter().enumerate() {
+                for s in 0..256 {
+                    t[k][s] = u32::from(code.codes[s]) | u32::from(code.code_lengths[s]) << 16;
+                }
+            }
+            t
+        })
+        .collect();
     let (mut x, mut y) = (0u32, 0u32);
     let (mut tile_x, mut tile_y) = (x & tile_mask, y & tile_mask);
     let mut histogram_ix = ((histogram_symbols[0] >> 8) & 0xffff) as usize;
     let mut codes = &huffman_codes[5 * histogram_ix..5 * histogram_ix + 5];
+    let mut literals = &literal_tables[histogram_ix];
     for v in refs {
         if tile_x != (x & tile_mask) || tile_y != (y & tile_mask) {
             tile_x = x & tile_mask;
@@ -907,24 +921,19 @@ fn store_image_to_bit_mask(
                 >> 8)
                 & 0xffff) as usize;
             codes = &huffman_codes[5 * histogram_ix..5 * histogram_ix + 5];
+            literals = &literal_tables[histogram_ix];
         }
         match v.mode {
             PixOrCopyMode::Literal => {
                 let p = v.argb_or_distance;
-                let (g, r) = (((p >> 8) & 0xff) as usize, ((p >> 16) & 0xff) as usize);
-                let (b, a) = ((p & 0xff) as usize, (p >> 24) as usize);
-                let (gl, rl) = (
-                    u32::from(codes[0].code_lengths[g]),
-                    u32::from(codes[1].code_lengths[r]),
-                );
-                let gr = u32::from(codes[0].codes[g]) | u32::from(codes[1].codes[r]) << gl;
-                bw.put_bits(gr, gl + rl);
-                let (bl, al) = (
-                    u32::from(codes[2].code_lengths[b]),
-                    u32::from(codes[3].code_lengths[a]),
-                );
-                let ba = u32::from(codes[2].codes[b]) | u32::from(codes[3].codes[a]) << bl;
-                bw.put_bits(ba, bl + al);
+                let tg = literals[0][((p >> 8) & 0xff) as usize];
+                let tr = literals[1][((p >> 16) & 0xff) as usize];
+                let tb = literals[2][(p & 0xff) as usize];
+                let ta = literals[3][(p >> 24) as usize];
+                let (gl, rl) = (tg >> 16, tr >> 16);
+                bw.put_bits((tg & 0xffff) | (tr & 0xffff) << gl, gl + rl);
+                let (bl, al) = (tb >> 16, ta >> 16);
+                bw.put_bits((tb & 0xffff) | (ta & 0xffff) << bl, bl + al);
             }
             PixOrCopyMode::CacheIdx => {
                 write_huffman_code(
