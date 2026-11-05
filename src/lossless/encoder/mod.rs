@@ -910,10 +910,20 @@ fn store_image_to_bit_mask(
         match v.mode {
             PixOrCopyMode::Literal => {
                 let p = v.argb_or_distance;
-                write_huffman_code(bw, &codes[0], ((p >> 8) & 0xff) as usize);
-                write_huffman_code(bw, &codes[1], ((p >> 16) & 0xff) as usize);
-                write_huffman_code(bw, &codes[2], (p & 0xff) as usize);
-                write_huffman_code(bw, &codes[3], (p >> 24) as usize);
+                let (g, r) = (((p >> 8) & 0xff) as usize, ((p >> 16) & 0xff) as usize);
+                let (b, a) = ((p & 0xff) as usize, (p >> 24) as usize);
+                let (gl, rl) = (
+                    u32::from(codes[0].code_lengths[g]),
+                    u32::from(codes[1].code_lengths[r]),
+                );
+                let gr = u32::from(codes[0].codes[g]) | u32::from(codes[1].codes[r]) << gl;
+                bw.put_bits(gr, gl + rl);
+                let (bl, al) = (
+                    u32::from(codes[2].code_lengths[b]),
+                    u32::from(codes[3].code_lengths[a]),
+                );
+                let ba = u32::from(codes[2].codes[b]) | u32::from(codes[3].codes[a]) << bl;
+                bw.put_bits(ba, bl + al);
             }
             PixOrCopyMode::CacheIdx => {
                 write_huffman_code(
