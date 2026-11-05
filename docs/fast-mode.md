@@ -14,7 +14,12 @@ Every variant decodes back to the input exactly.
 |---|---|---|---|---|
 | none (libwebp parity) | 0 | 175 ms, 5,544,036 B | 94 ms, 2,757,390 B | 58 ms, 1,265,434 B |
 | `run_refs` | 0 | 45.5 ms, 5,542,768 B | 23 ms, 2,277,156 B | 24 ms, 3,044,826 B |
-| none (libwebp parity) | 4 | 1732 ms, 4,816,002 B | | |
+| none (libwebp parity) | 4 | 1737 ms, 4,816,002 B | 921 ms, 1,779,556 B | 726 ms, 665,972 B |
+| `short_chain` | 4 | 811 ms, 4,816,002 B | 703 ms, 1,779,556 B | 657 ms, 666,256 B |
+| `run_refs` | 4 | 486 ms, 4,816,002 B | 552 ms, 1,868,928 B | 640 ms, 2,508,124 B |
+| none (libwebp parity) | 6 | 1821 ms, 4,811,944 B | 977 ms, 1,781,194 B | 778 ms, 662,184 B |
+| `short_chain` | 6 | 885 ms, 4,811,944 B | 770 ms, 1,781,194 B | 741 ms, 662,792 B |
+| `run_refs` | 6 | 559 ms, 4,811,944 B | 634 ms, 1,867,748 B | 711 ms, 2,494,032 B |
 
 `run_refs`: backward references by run length only (left or upper neighbour), no hash chain;
 `src/lossless/encoder/fast.rs` then counts and writes the image from the pixels without a
@@ -22,4 +27,9 @@ reference per pixel. Photos lose nothing; a graphic with far-back repeats grows 
 logo 2.4x), since only LZ77 sees them.
 
 `short_chain`: the hash chain filled with quality 0's effort (8 chain steps, a window of 16
-rows) whatever the quality, the rest of the method unchanged. Not measured yet.
+rows) whatever the quality, the rest of the method unchanged. On photos the full search finds
+nothing the short one does not, so the bytes are identical and methods 4 to 6 take half the
+time; the graphic grows by under 0.1%. This is what `fast_mode` turns on at methods 1 to 6.
+
+`run_refs` above method 0 is not in the `fast_mode` set: 3.6x on photos at identical bytes,
+but +5% on the RGBA photo and 3.8x on the graphic.
