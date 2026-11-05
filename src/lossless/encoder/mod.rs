@@ -1215,18 +1215,30 @@ fn encode_stream<P: Pixel>(
 }
 
 /// `VP8LEncodeImage` minus the RIFF header: the `VP8L` chunk payload of an ARGB image.
-pub(crate) fn encode_argb(mut config: Config, mut argb: Vec<u32>, width: u32, height: u32) -> Vec<u8> {
+pub(crate) fn encode_argb(config: Config, argb: Vec<u32>, width: u32, height: u32) -> Vec<u8> {
+    encode_argb_opaque(config, argb, width, height, false)
+}
+
+/// [`encode_argb`] told whether every pixel is opaque, which saves the passes that would
+/// find that out and clear what is transparent.
+fn encode_argb_opaque(
+    mut config: Config,
+    mut argb: Vec<u32>,
+    width: u32,
+    height: u32,
+    opaque: bool,
+) -> Vec<u8> {
     if config.method != 0 {
         config.fast = false;
     }
-    if !config.exact {
+    if !config.exact && !opaque {
         for p in argb.iter_mut() {
             if *p >> 24 == 0 {
                 *p = 0;
             }
         }
     }
-    let has_alpha = argb.iter().any(|&p| p >> 24 != 0xff);
+    let has_alpha = !opaque && argb.iter().any(|&p| p >> 24 != 0xff);
     let mut bw = BitWriter::with_capacity(argb.len());
     bw.put_bits(width - 1, 14);
     bw.put_bits(height - 1, 14);
@@ -1270,7 +1282,8 @@ pub(crate) fn encode_lossless(
             })
             .collect(),
     };
-    encode_argb(config, argb, width, height)
+    let opaque = matches!(color, ColorType::L8 | ColorType::Rgb8);
+    encode_argb_opaque(config, argb, width, height, opaque)
 }
 
 /// `EncodeLossless` of alpha_enc.c: the green-only image of `alpha`, without header.
