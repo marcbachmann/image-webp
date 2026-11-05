@@ -33,7 +33,7 @@ impl BitWriter {
     /// Bytes written so far, counting a partial byte as a whole one.
     /// Puts up to 60 bits at once. Where they fit the accumulator, its whole bytes go out
     /// with one 8-byte store and no branch per bit group; otherwise two [`put_bits`](Self::put_bits).
-    #[inline]
+    #[inline(always)]
     pub(crate) fn put_bits64(&mut self, bits: u64, n_bits: u32) {
         if self.used + n_bits < 64 {
             self.bits |= bits << self.used;
