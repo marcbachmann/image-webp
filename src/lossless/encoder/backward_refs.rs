@@ -397,39 +397,62 @@ fn backward_references_rle(
     }
 }
 
-/// `backward_references_rle` without a colour cache, for the fast mode: a pixel that
-/// repeats neither its left nor its upper neighbour is a literal without any further look.
-fn backward_references_runs(xsize: u32, argb: &[u32], refs: &mut BackwardRefs) {
-    let pix_count = argb.len();
-    let xsize = xsize as usize;
-    refs.clear();
-    refs.reserve(pix_count);
-    refs.push(PixOrCopy::literal(argb[0]));
-    let mut i = 1;
-    while i < pix_count {
-        let p = argb[i];
-        if p != argb[i - 1] && (i < xsize || p != argb[i - xsize]) {
-            refs.push(PixOrCopy::literal(p));
-            i += 1;
-            continue;
+/// The backward references of the fast mode, found as they are read: a pixel that repeats
+/// neither its left nor its upper neighbour is a literal, a run of either is a copy, with no
+/// colour cache. A pure function of the pixels, so the histograms and the writer read it
+/// twice instead of holding a reference per pixel.
+#[derive(Clone)]
+pub(crate) struct Runs<'a> {
+    argb: &'a [u32],
+    xsize: usize,
+    i: usize,
+    /// The plane codes of the distances 1 and `xsize`.
+    left: u32,
+    up: u32,
+}
+
+impl<'a> Runs<'a> {
+    pub(crate) fn new(argb: &'a [u32], xsize: u32) -> Self {
+        Self {
+            argb,
+            xsize: xsize as usize,
+            i: 0,
+            left: distance_to_plane_code(xsize, 1),
+            up: distance_to_plane_code(xsize, xsize),
         }
-        let max_len = max_find_copy_length((pix_count - i) as u32) as usize;
+    }
+}
+
+impl Iterator for Runs<'_> {
+    type Item = PixOrCopy;
+
+    #[inline]
+    fn next(&mut self) -> Option<PixOrCopy> {
+        let (argb, xsize, i) = (self.argb, self.xsize, self.i);
+        if i >= argb.len() {
+            return None;
+        }
+        let p = argb[i];
+        if i == 0 || (p != argb[i - 1] && (i < xsize || p != argb[i - xsize])) {
+            self.i = i + 1;
+            return Some(PixOrCopy::literal(p));
+        }
+        let max_len = max_find_copy_length((argb.len() - i) as u32) as usize;
         let rle_len = find_match_length(argb, i, i - 1, 0, max_len);
         let prev_row_len = if i < xsize {
             0
         } else {
             find_match_length(argb, i, i - xsize, 0, max_len)
         };
-        if rle_len >= prev_row_len && rle_len >= MIN_LENGTH as usize {
-            refs.push(PixOrCopy::copy(1, rle_len as u32));
-            i += rle_len;
+        let v = if rle_len >= prev_row_len && rle_len >= MIN_LENGTH as usize {
+            PixOrCopy::copy(self.left, rle_len as u32)
         } else if prev_row_len >= MIN_LENGTH as usize {
-            refs.push(PixOrCopy::copy(xsize as u32, prev_row_len as u32));
-            i += prev_row_len;
+            PixOrCopy::copy(self.up, prev_row_len as u32)
         } else {
-            refs.push(PixOrCopy::literal(p));
-            i += 1;
-        }
+            PixOrCopy::literal(p)
+        };
+        self.i = i + usize::from(v.len);
+        Some(v)
     }
 }
 
@@ -764,7 +787,6 @@ pub(crate) fn get_backward_references(
     argb: &[u32],
     quality: i32,
     low_effort: bool,
-    fast: bool,
     mut lz77_types_to_try: u32,
     cache_bits_max: u32,
     do_no_cache: bool,
@@ -772,11 +794,7 @@ pub(crate) fn get_backward_references(
     refs: &mut RefsSet,
 ) -> u32 {
     if low_effort {
-        if fast {
-            backward_references_runs(width, argb, &mut refs.best);
-        } else {
-            backward_references_lz77(width, height, argb, 0, hash_chain, &mut refs.best);
-        }
+        backward_references_lz77(width, height, argb, 0, hash_chain, &mut refs.best);
         backward_references_2d_locality(width, &mut refs.best);
         return 0;
     }

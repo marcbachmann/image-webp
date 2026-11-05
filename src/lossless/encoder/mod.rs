@@ -34,6 +34,7 @@ pub(crate) use alpha::encode_alpha_filtered;
 use std::borrow::Cow;
 
 use backward_refs::{
+    PixOrCopy, Runs,
     get_backward_references, BackwardRefs, HashChain, PixOrCopyMode, RefsSet, LZ77_BOX, LZ77_RLE,
     LZ77_STANDARD,
 };
@@ -879,7 +880,7 @@ fn store_image_to_bit_mask(
     bw: &mut BitWriter,
     width: u32,
     histo_bits: u32,
-    refs: &BackwardRefs,
+    refs: impl IntoIterator<Item = PixOrCopy>,
     histogram_symbols: &[u32],
     huffman_codes: &[HuffmanTreeCode],
 ) {
@@ -971,7 +972,6 @@ fn encode_image_no_huffman(
         argb,
         quality,
         false,
-        false,
         LZ77_STANDARD | LZ77_RLE,
         0,
         false,
@@ -983,7 +983,7 @@ fn encode_image_no_huffman(
     let mut codes = get_huff_bit_lengths_and_codes(std::slice::from_mut(&mut histo));
     bw.put_bits(0, 1);
     store_huffman_codes(bw, &mut codes);
-    store_image_to_bit_mask(bw, width, 0, &refs.best, &[0], &codes);
+    store_image_to_bit_mask(bw, width, 0, refs.best.iter().copied(), &[0], &codes);
 }
 
 /// `EncodeImageInternal`: the entropy-coded image, the smallest over the sub-configurations
@@ -1018,6 +1018,24 @@ fn encode_image_internal(
     };
     let init = std::mem::take(bw);
     let mut best: Option<BitWriter> = None;
+    if fast {
+        let mut w = init;
+        encode_refs(
+            &mut w,
+            Runs::new(argb, width),
+            width,
+            height,
+            quality,
+            low_effort,
+            0,
+            histogram_bits_in,
+            &mut histogram_argb,
+            &mut hash_chain_histogram,
+            refs_side,
+        );
+        *bw = w;
+        return;
+    }
     for sub_config in &config.sub_configs {
         let cache_bits_best = get_backward_references(
             width,
@@ -1025,7 +1043,6 @@ fn encode_image_internal(
             argb,
             quality,
             low_effort,
-            fast,
             sub_config.lz77,
             cache_bits_init,
             sub_config.do_no_cache,
@@ -1038,21 +1055,61 @@ fn encode_image_internal(
                 break;
             }
             let mut w = init.clone();
-            let mut histogram_bits = histogram_bits_in;
             let refs_i: &BackwardRefs = if i_cache == 0 {
                 &refs.best
             } else {
                 &refs.no_cache
             };
+            encode_refs(
+                &mut w,
+                refs_i.iter().copied(),
+                width,
+                height,
+                quality,
+                low_effort,
+                cache_bits_tmp,
+                histogram_bits_in,
+                &mut histogram_argb,
+                &mut hash_chain_histogram,
+                refs_side,
+            );
+            if best
+                .as_ref()
+                .map_or(true, |b| w.num_bytes() < b.num_bytes())
+            {
+                best = Some(w);
+            }
+        }
+    }
+    *bw = best.unwrap();
+}
+
+/// The entropy-coded image of one set of backward references: the histogram image, the
+/// Huffman codes and the symbols, appended to `w`.
+#[allow(clippy::too_many_arguments)]
+fn encode_refs<I: Iterator<Item = PixOrCopy> + Clone>(
+    w: &mut BitWriter,
+    refs_i: I,
+    width: u32,
+    height: u32,
+    quality: i32,
+    low_effort: bool,
+    cache_bits_tmp: u32,
+    histogram_bits_in: u32,
+    histogram_argb: &mut Vec<u32>,
+    hash_chain_histogram: &mut HashChain,
+    refs_side: &mut RefsSet,
+) {
+    let mut histogram_bits = histogram_bits_in;
             let mut histogram_image = get_histo_image_symbols(
                 width,
                 height,
-                refs_i,
+                refs_i.clone(),
                 quality,
                 low_effort,
                 histogram_bits,
                 cache_bits_tmp,
-                &mut histogram_argb,
+                histogram_argb,
             );
             let mut codes = get_huff_bit_lengths_and_codes(&mut histogram_image);
             drop(histogram_image);
@@ -1073,7 +1130,7 @@ fn encode_image_internal(
             w.put_bits(u32::from(write_histogram_image), 1);
             if write_histogram_image {
                 histogram_bits = optimize_sampling(
-                    &mut histogram_argb,
+                    histogram_argb,
                     width,
                     height,
                     histogram_bits_in,
@@ -1085,9 +1142,9 @@ fn encode_image_internal(
                     sub_sample_size(height, histogram_bits),
                 );
                 encode_image_no_huffman(
-                    &mut w,
+                    w,
                     &histogram_argb[..(hw * hh) as usize],
-                    &mut hash_chain_histogram,
+                    hash_chain_histogram,
                     refs_side,
                     hw,
                     hh,
@@ -1095,24 +1152,15 @@ fn encode_image_internal(
                     low_effort,
                 );
             }
-            store_huffman_codes(&mut w, &mut codes[..5 * histogram_image_size as usize]);
+            store_huffman_codes(w, &mut codes[..5 * histogram_image_size as usize]);
             store_image_to_bit_mask(
-                &mut w,
+                w,
                 width,
                 histogram_bits,
                 refs_i,
-                &histogram_argb,
+                histogram_argb,
                 &codes,
             );
-            if best
-                .as_ref()
-                .map_or(true, |b| w.num_bytes() < b.num_bytes())
-            {
-                best = Some(w);
-            }
-        }
-    }
-    *bw = best.unwrap();
 }
 
 /// `VP8LEncodeStream`: the transforms and entropy-coded image of `argb`, appended to `bw`.
@@ -1337,7 +1385,7 @@ mod tests {
         bw.put_bits(0, 1);
         bw.put_bits(0, 1);
         store_huffman_codes(&mut bw, &mut codes);
-        store_image_to_bit_mask(&mut bw, width, 0, &refs, &[0], &codes);
+        store_image_to_bit_mask(&mut bw, width, 0, refs.iter().copied(), &[0], &codes);
         let mut payload = vec![0x2f];
         payload.extend_from_slice(&bw.finish());
         let mut data = Vec::new();

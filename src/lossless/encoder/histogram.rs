@@ -725,7 +725,7 @@ fn get_combine_cost_factor(histo_size: usize, quality: i32) -> i32 {
 pub(crate) fn get_histo_image_symbols(
     xsize: u32,
     ysize: u32,
-    refs: &[PixOrCopy],
+    refs: impl IntoIterator<Item = PixOrCopy>,
     quality: i32,
     low_effort: bool,
     histogram_bits: u32,
@@ -751,7 +751,7 @@ pub(crate) fn get_histo_image_symbols(
         let (mut x, mut y) = (0u32, 0u32);
         for v in refs {
             let ix = ((y >> histogram_bits) * histo_xsize + (x >> histogram_bits)) as usize;
-            orig[ix].add_single(v, None);
+            orig[ix].add_single(&v, None);
             x += u32::from(v.len);
             while x >= xsize {
                 x -= xsize;
