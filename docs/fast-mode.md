@@ -31,5 +31,18 @@ rows) whatever the quality, the rest of the method unchanged. On photos the full
 nothing the short one does not, so the bytes are identical and methods 4 to 6 take half the
 time; the graphic grows by under 0.1%. This is what `fast_mode` turns on at methods 1 to 6.
 
+On top of `short_chain` at method 4 (second run, so `short_chain` alone read 855 / 704 / 661 ms there):
+
+| knob | RGB photo | RGBA photo | RGBA graphic |
+|---|---|---|---|
+| `no_trace` | 807 ms, same bytes | 704 ms, same bytes | 637 ms, 671,924 B (+0.85%) |
+| `no_cache` | 652 ms, same bytes | 621 ms, 1,868,928 B (+5.0%) | 616 ms, same bytes |
+| both | 653 ms, same bytes | 626 ms, +5.0% | 591 ms, +0.85% |
+
+`no_trace`: no cost-model pass over the references (libwebp runs it from quality 25).
+`no_cache`: no colour cache, so none of the search over its sizes; the +5% on the RGBA photo is
+what the cache was buying there, and it is also where `run_refs` lost its 5%.
+Neither is in the `fast_mode` set: each costs bytes on one of the three inputs.
+
 `run_refs` above method 0 is not in the `fast_mode` set: 3.6x on photos at identical bytes,
 but +5% on the RGBA photo and 3.8x on the graphic.
