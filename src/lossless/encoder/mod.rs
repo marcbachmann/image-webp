@@ -993,7 +993,9 @@ fn encode_image_internal(
         * sub_sample_size(height, histogram_bits_in)) as usize;
     let mut histogram_argb = vec![0u32; xysize];
     let mut hash_chain_histogram = HashChain::default();
-    hash_chain.fill(quality, argb, width, height, low_effort);
+    if !(low_effort && backward_refs::m0_rle()) {
+        hash_chain.fill(quality, argb, width, height, low_effort);
+    }
     let cache_bits_init = if cache_bits == 0 {
         MAX_COLOR_CACHE_BITS
     } else {
