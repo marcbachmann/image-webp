@@ -76,8 +76,36 @@ pub(crate) struct Config {
     pub(crate) use_predictor: bool,
     /// Near-lossless level 0..=100, 100 for none.
     pub(crate) near_lossless: i32,
-    /// Method 0 with run-length references only and no hash chain; not libwebp's bitstream.
-    pub(crate) fast: bool,
+    /// The shortcuts of `EncoderParams::fast_mode`.
+    pub(crate) fast: FastMode,
+}
+
+/// The shortcuts of `EncoderParams::fast_mode`, each tracked on its own (docs/fast-mode.md)
+/// so that any can be offered by itself: none of them is libwebp's bitstream.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FastMode {
+    /// Backward references by run length only, no hash chain: [`fast`] does the entropy
+    /// coding without a reference per pixel.
+    pub(crate) run_refs: bool,
+    /// The hash chain searched with quality 0's effort: 8 chain steps and a window of 16 rows.
+    pub(crate) short_chain: bool,
+}
+
+impl FastMode {
+    /// What `fast_mode` turns on at `method`.
+    pub(crate) fn for_method(on: bool, method: i32) -> Self {
+        let env = std::env::var("IMAGE_WEBP_FAST_SET").ok();
+        if let Some(set) = env.filter(|_| on) {
+            return Self {
+                run_refs: set.contains("run"),
+                short_chain: set.contains("chain"),
+            };
+        }
+        Self {
+            run_refs: on && method == 0,
+            short_chain: on && method != 0,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1011,7 +1039,7 @@ fn encode_image_internal(
     height: u32,
     quality: i32,
     low_effort: bool,
-    fast: bool,
+    fast: FastMode,
     config: &CrunchConfig,
     cache_bits: u32,
     histogram_bits_in: u32,
@@ -1020,8 +1048,9 @@ fn encode_image_internal(
         * sub_sample_size(height, histogram_bits_in)) as usize;
     let mut histogram_argb = vec![0u32; xysize];
     let mut hash_chain_histogram = HashChain::default();
-    if !fast {
-        hash_chain.fill(quality, argb, width, height, low_effort);
+    if !fast.run_refs {
+        let chain_quality = if fast.short_chain { 0 } else { quality };
+        hash_chain.fill(chain_quality, argb, width, height, low_effort);
     }
     let cache_bits_init = if cache_bits == 0 {
         MAX_COLOR_CACHE_BITS
@@ -1030,7 +1059,7 @@ fn encode_image_internal(
     };
     let init = std::mem::take(bw);
     let mut best: Option<BitWriter> = None;
-    if fast {
+    if fast.run_refs {
         let mut w = init;
         encode_refs(
             &mut w,
@@ -1224,15 +1253,12 @@ pub(crate) fn encode_argb(config: Config, argb: Vec<u32>, width: u32, height: u3
 /// [`encode_argb`] told whether every pixel is opaque, which saves the passes that would
 /// find that out and clear what is transparent.
 fn encode_argb_opaque(
-    mut config: Config,
+    config: Config,
     mut argb: Vec<u32>,
     width: u32,
     height: u32,
     opaque: bool,
 ) -> Vec<u8> {
-    if config.method != 0 {
-        config.fast = false;
-    }
     if !config.exact && !opaque {
         for p in argb.iter_mut() {
             if *p >> 24 == 0 {
@@ -1316,7 +1342,7 @@ fn encode_green<P: Pixel>(
         exact: true,
         use_predictor: true,
         near_lossless: 100,
-        fast: false,
+        fast: FastMode::default(),
     };
     let mut bw = BitWriter::with_capacity(pic.len() >> 3);
     encode_stream(config, pic, width, height, &mut bw);

@@ -16,7 +16,7 @@ fn main() {
     params.lossless_quality = 0;
     params.lossless_method = 0;
     params.lossless_exact = true;
-    params.lossless_fast = std::env::var_os("FAST").is_some();
+    params.fast_mode = std::env::var_os("FAST").is_some();
     enc.set_params(params);
     enc.encode(px, w, h, color).unwrap();
     let mut dec = WebPDecoder::new(std::io::Cursor::new(&out)).unwrap();

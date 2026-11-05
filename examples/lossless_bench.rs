@@ -123,7 +123,7 @@ fn main() {
             let mut p = EncoderParams::default();
             p.lossless_quality = q;
             p.lossless_method = m;
-            p.lossless_fast = fast;
+            p.fast_mode = fast;
             enc.set_params(p);
             enc.encode(&px, w, h, color).unwrap();
             out.len()
