@@ -44,5 +44,18 @@ On top of `short_chain` at method 4 (second run, so `short_chain` alone read 855
 what the cache was buying there, and it is also where `run_refs` lost its 5%.
 Neither is in the `fast_mode` set: each costs bytes on one of the three inputs.
 
+Predictor search knobs, on top of `short_chain` at method 4 (`short_chain` alone read
+806 / 706 / 660 ms in that run):
+
+| knob | RGB photo | RGBA photo | RGBA graphic |
+|---|---|---|---|
+| `pred_subset` | 687 ms, 4,813,998 B (-0.04%) | 471 ms, 1,779,604 B (+0.003%) | 422 ms, 664,810 B (-0.2%) |
+| `pred_single` | 670 ms, 5,415,528 B (+12.4%) | 389 ms, 2,124,622 B (+19.4%) | 332 ms, 722,172 B (+8.4%) |
+
+`pred_subset`: the predictor search tries four modes per tile (left, top, select, gradient)
+instead of libwebp's 14. Bytes within 0.2% either way, 15-36% faster: in the `fast_mode` set
+at methods 1 to 6. `pred_single`: libwebp's method-0 predictor (select) for every tile with
+no search; a knob only.
+
 `run_refs` above method 0 is not in the `fast_mode` set: 3.6x on photos at identical bytes,
 but +5% on the RGBA photo and 3.8x on the graphic.

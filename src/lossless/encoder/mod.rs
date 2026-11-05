@@ -119,7 +119,7 @@ impl FastMode {
             short_chain: on && method != 0,
             no_trace: false,
             no_cache: false,
-            pred_subset: false,
+            pred_subset: on && method != 0,
             pred_single: false,
         }
     }
