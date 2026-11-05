@@ -89,6 +89,11 @@ pub(crate) struct FastMode {
     pub(crate) run_refs: bool,
     /// The hash chain searched with quality 0's effort: 8 chain steps and a window of 16 rows.
     pub(crate) short_chain: bool,
+    /// No cost-model pass over the references (libwebp's `BackwardReferencesTraceBackwards`,
+    /// which it runs from quality 25).
+    pub(crate) no_trace: bool,
+    /// No colour cache, so no search over its sizes (libwebp has none below quality 26).
+    pub(crate) no_cache: bool,
 }
 
 impl FastMode {
@@ -99,11 +104,15 @@ impl FastMode {
             return Self {
                 run_refs: set.contains("run"),
                 short_chain: set.contains("chain"),
+                no_trace: set.contains("trace"),
+                no_cache: set.contains("cache"),
             };
         }
         Self {
             run_refs: on && method == 0,
             short_chain: on && method != 0,
+            no_trace: false,
+            no_cache: false,
         }
     }
 }
@@ -1012,6 +1021,7 @@ fn encode_image_no_huffman(
         argb,
         quality,
         false,
+        FastMode::default(),
         LZ77_STANDARD | LZ77_RLE,
         0,
         false,
@@ -1084,6 +1094,7 @@ fn encode_image_internal(
             argb,
             quality,
             low_effort,
+            fast,
             sub_config.lz77,
             cache_bits_init,
             sub_config.do_no_cache,

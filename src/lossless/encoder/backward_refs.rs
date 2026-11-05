@@ -728,6 +728,7 @@ pub(crate) fn get_backward_references(
     argb: &[u32],
     quality: i32,
     low_effort: bool,
+    fast: super::FastMode,
     mut lz77_types_to_try: u32,
     cache_bits_max: u32,
     do_no_cache: bool,
@@ -773,7 +774,8 @@ pub(crate) fn get_backward_references(
                     continue;
                 }
                 if i == 0 {
-                    cache_bits = calculate_best_cache_size(argb, quality, tmp, cache_bits);
+                    let cache_quality = if fast.no_cache { 0 } else { quality };
+                    cache_bits = calculate_best_cache_size(argb, cache_quality, tmp, cache_bits);
                     if cache_bits > 0 {
                         backward_refs_with_local_cache(argb, cache_bits, tmp);
                     }
@@ -805,7 +807,9 @@ pub(crate) fn get_backward_references(
             continue;
         }
         let target: &mut BackwardRefs = if i == 1 { &mut *no_cache } else { &mut *best };
-        if (lz77_types_best[i] == LZ77_STANDARD || lz77_types_best[i] == LZ77_BOX) && quality >= 25
+        if (lz77_types_best[i] == LZ77_STANDARD || lz77_types_best[i] == LZ77_BOX)
+            && quality >= 25
+            && !fast.no_trace
         {
             let hc: &HashChain = if lz77_types_best[i] == LZ77_STANDARD {
                 hash_chain
