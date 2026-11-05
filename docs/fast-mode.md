@@ -3,7 +3,8 @@
 `EncoderParams::fast_mode` trades byte parity with libwebp for speed. Each shortcut is a
 `lossless::encoder::FastMode` field of its own so that any can be offered by itself; the
 `fast_mode` flag turns on the set that measured best per method, `FastMode::for_method`.
-`IMAGE_WEBP_FAST_SET=run,chain` overrides that set for measurement.
+`IMAGE_WEBP_FAST_SET=run,chain,trace,cache,subset,single,lz77` (any subset of those words)
+overrides that set, for measuring a knob on its own.
 
 Measured on the x86 worker (i9-13900, pinned, min of 3 interleaved runs), 6 MP inputs:
 `tests/reference/gallery1/3.png` resized to 3000x2000 (RGB photo), the same with the alpha
@@ -14,6 +15,10 @@ Every variant decodes back to the input exactly.
 |---|---|---|---|---|
 | none (libwebp parity) | 0 | 175 ms, 5,544,036 B | 94 ms, 2,757,390 B | 58 ms, 1,265,434 B |
 | `run_refs` | 0 | 45.5 ms, 5,542,768 B | 23 ms, 2,277,156 B | 24 ms, 3,044,826 B |
+| none (libwebp parity) | 2 | 1729 ms, 4,815,964 B | 902 ms, 1,775,594 B | 697 ms, 913,328 B |
+| `fast_mode` (= `short_chain` + `pred_subset`) | 2 | 678 ms, 4,812,502 B | 461 ms, 1,775,758 B | 450 ms, 909,482 B |
+| `fast_mode` | 4 | 712 ms, 4,813,998 B | 477 ms, 1,779,604 B | 427 ms, 664,810 B |
+| `fast_mode` | 6 | 854 ms, 4,811,716 B | 544 ms, 1,782,872 B | 501 ms, 665,236 B |
 | none (libwebp parity) | 4 | 1737 ms, 4,816,002 B | 921 ms, 1,779,556 B | 726 ms, 665,972 B |
 | `short_chain` | 4 | 811 ms, 4,816,002 B | 703 ms, 1,779,556 B | 657 ms, 666,256 B |
 | `run_refs` | 4 | 486 ms, 4,816,002 B | 552 ms, 1,868,928 B | 640 ms, 2,508,124 B |
