@@ -1134,8 +1134,8 @@ fn encode_stream<P: Pixel>(
 
 /// `VP8LEncodeImage` minus the RIFF header: the `VP8L` chunk payload of an ARGB image.
 pub(crate) fn encode_argb(mut config: Config, mut argb: Vec<u32>, width: u32, height: u32) -> Vec<u8> {
-    if config.fast {
-        config.method = 0;
+    if config.method != 0 {
+        config.fast = false;
     }
     if !config.exact {
         for p in argb.iter_mut() {

@@ -32,11 +32,11 @@ pub struct EncoderParams {
     /// `near_lossless`: pixels move within a bound before the encode where that packs their
     /// residuals better. Defaults to 100.
     pub near_lossless: u8,
-    /// Lossless encoding below libwebp's method 0: the same transforms and entropy coding,
-    /// but backward references found by run length only, with no LZ77 search. About twice as
-    /// fast as method 0 for files of the same size or smaller. The output is valid WebP but
-    /// not what libwebp writes, so byte parity with libwebp does not hold for it. Off by
-    /// default; when on, `lossless_method` is ignored.
+    /// A faster `lossless_method` 0: the same transforms and entropy coding, but backward
+    /// references found by run length only, with no LZ77 search. About twice as fast as
+    /// libwebp's method 0; photos come out the same size, graphics with repeated content
+    /// larger. The output is valid WebP but not what libwebp writes, so byte parity with
+    /// libwebp does not hold for it. Off by default, and ignored at methods 1 to 6.
     pub lossless_fast: bool,
     /// Compress the alpha plane of lossy images, as libwebp's `alpha_compression`. When off,
     /// the `ALPH` chunk holds the plane uncompressed, which is faster and bigger. Defaults to on.
