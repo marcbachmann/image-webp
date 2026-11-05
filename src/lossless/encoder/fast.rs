@@ -66,15 +66,44 @@ enum Run<'a> {
     Copy(u32, u32, u32, u32),
 }
 
-/// Walks the runs of `argb` with `histo_bits` tiles, handing each to `f`.
-fn walk(argb: &[u32], width: u32, histo_bits: u32, mut f: impl FnMut(Run<'_>)) {
+/// A copy found by [`scan`]: where it starts, its distance's plane code and its length.
+#[derive(Clone, Copy)]
+pub(crate) struct Copy {
+    at: u32,
+    code: u32,
+    len: u32,
+}
+
+/// The copies of `argb`, in order; everything between them is literals.
+pub(crate) fn scan(argb: &[u32], width: u32) -> Vec<Copy> {
     let (left, up) = plane_codes(width);
     let xsize = width as usize;
-    let tile = 1u32 << histo_bits;
-    let (mut x, mut y) = (0u32, 0u32);
+    let mut copies = Vec::new();
     let mut i = 0;
     while i < argb.len() {
         let (n, run) = next_run(argb, xsize, i, left, up);
+        i += n;
+        if let Some((code, len)) = run {
+            copies.push(Copy {
+                at: i as u32,
+                code,
+                len,
+            });
+            i += len as usize;
+        }
+    }
+    copies
+}
+
+/// Walks the runs of `argb` with `histo_bits` tiles, handing each to `f`.
+fn walk(argb: &[u32], width: u32, histo_bits: u32, copies: &[Copy], mut f: impl FnMut(Run<'_>)) {
+    let tile = 1u32 << histo_bits;
+    let (mut x, mut y) = (0u32, 0u32);
+    let mut i = 0;
+    let mut copies = copies.iter();
+    while i < argb.len() {
+        let run = copies.next();
+        let n = run.map_or(argb.len(), |c| c.at as usize) - i;
         let mut rest = n;
         while rest > 0 {
             let end = (x + rest as u32).min(width).min((x | (tile - 1)) + 1);
@@ -88,7 +117,7 @@ fn walk(argb: &[u32], width: u32, histo_bits: u32, mut f: impl FnMut(Run<'_>)) {
                 y += 1;
             }
         }
-        if let Some((code, len)) = run {
+        if let Some(&Copy { code, len, .. }) = run {
             f(Run::Copy(x, y, code, len));
             i += len as usize;
             x += len;
@@ -102,10 +131,16 @@ fn walk(argb: &[u32], width: u32, histo_bits: u32, mut f: impl FnMut(Run<'_>)) {
 
 /// Fills the `histo_bits` tile histograms of `argb`, as `get_histo_image_symbols` does
 /// from references.
-pub(crate) fn count(argb: &[u32], width: u32, histo_bits: u32, histos: &mut [Histogram]) {
+pub(crate) fn count(
+    argb: &[u32],
+    width: u32,
+    histo_bits: u32,
+    copies: &[Copy],
+    histos: &mut [Histogram],
+) {
     let histo_xsize = sub_sample_size(width, histo_bits);
     let index = |x: u32, y: u32| ((y >> histo_bits) * histo_xsize + (x >> histo_bits)) as usize;
-    walk(argb, width, histo_bits, |run| match run {
+    walk(argb, width, histo_bits, copies, |run| match run {
         Run::Literals(x, y, pixels) => {
             let h = &mut histos[index(x, y)];
             let green = &mut h.literal[..256];
@@ -128,6 +163,7 @@ pub(crate) fn write(
     argb: &[u32],
     width: u32,
     histo_bits: u32,
+    copies: &[Copy],
     histogram_symbols: &[u32],
     huffman_codes: &[HuffmanTreeCode],
 ) {
@@ -150,7 +186,7 @@ pub(crate) fn write(
         })
         .collect();
     let mut w = std::mem::take(bw);
-    walk(argb, width, histo_bits, |run| match run {
+    walk(argb, width, histo_bits, copies, |run| match run {
         Run::Literals(x, y, pixels) => {
             let t = &literal_tables[histogram_ix(x, y)];
             for &p in pixels {

@@ -1032,7 +1032,7 @@ fn encode_image_internal(
         let mut w = init;
         encode_refs(
             &mut w,
-            Source::<std::iter::Empty<PixOrCopy>>::Fast(argb),
+            Source::<std::iter::Empty<PixOrCopy>>::Fast(argb, &fast::scan(argb, width)),
             width,
             height,
             quality,
@@ -1098,7 +1098,7 @@ fn encode_image_internal(
 /// pixels themselves, read as runs.
 enum Source<'a, I> {
     Refs(I),
-    Fast(&'a [u32]),
+    Fast(&'a [u32], &'a [fast::Copy]),
 }
 
 /// The entropy-coded image of one set of backward references: the histogram image, the
@@ -1125,7 +1125,9 @@ fn encode_refs<I: Iterator<Item = PixOrCopy> + Clone>(
                     Source::Refs(refs) => {
                         histogram::fill_from_refs(refs.clone(), width, histogram_bits, histos)
                     }
-                    Source::Fast(argb) => fast::count(argb, width, histogram_bits, histos),
+                    Source::Fast(argb, copies) => {
+                        fast::count(argb, width, histogram_bits, copies, histos)
+                    }
                 },
                 quality,
                 low_effort,
@@ -1179,8 +1181,8 @@ fn encode_refs<I: Iterator<Item = PixOrCopy> + Clone>(
                 Source::Refs(refs) => {
                     store_image_to_bit_mask(w, width, histogram_bits, refs, histogram_argb, &codes)
                 }
-                Source::Fast(argb) => {
-                    fast::write(w, argb, width, histogram_bits, histogram_argb, &codes)
+                Source::Fast(argb, copies) => {
+                    fast::write(w, argb, width, histogram_bits, copies, histogram_argb, &codes)
                 }
             }
 }
