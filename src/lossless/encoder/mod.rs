@@ -950,19 +950,7 @@ fn store_image_to_bit_mask(
     } else {
         !((1u32 << histo_bits) - 1)
     };
-    // A literal's four codes and lengths as one word each, in order green, red, blue, alpha.
-    let literal_tables: Vec<[[u32; 256]; 4]> = huffman_codes
-        .chunks_exact(5)
-        .map(|c| {
-            let mut t = [[0u32; 256]; 4];
-            for (k, code) in c[..4].iter().enumerate() {
-                for s in 0..256 {
-                    t[k][s] = u32::from(code.codes[s]) | u32::from(code.code_lengths[s]) << 16;
-                }
-            }
-            t
-        })
-        .collect();
+    let literal_tables = fast::literal_tables(huffman_codes);
     let (mut x, mut y) = (0u32, 0u32);
     let (mut tile_x, mut tile_y) = (x & tile_mask, y & tile_mask);
     let mut histogram_ix = ((histogram_symbols[0] >> 8) & 0xffff) as usize;

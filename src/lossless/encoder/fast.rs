@@ -157,6 +157,27 @@ pub(crate) fn count(
     });
 }
 
+/// Per histogram, a literal's four codes with their lengths as one word each
+/// (`code | len << 16`), in order green, red, blue, alpha.
+pub(crate) fn literal_tables(huffman_codes: &[HuffmanTreeCode]) -> Vec<[[u32; 256]; 4]> {
+    huffman_codes
+        .as_chunks::<5>()
+        .0
+        .iter()
+        .map(|c| {
+            let mut t = [[0u32; 256]; 4];
+            for (plane, code) in t.iter_mut().zip(c) {
+                for ((entry, &sym), &len) in
+                    plane.iter_mut().zip(&code.codes).zip(&code.code_lengths)
+                {
+                    *entry = u32::from(sym) | u32::from(len) << 16;
+                }
+            }
+            t
+        })
+        .collect()
+}
+
 /// Writes the codes of `argb`, as `store_image_to_bit_mask` does from references.
 pub(crate) fn write(
     bw: &mut BitWriter,
@@ -172,19 +193,7 @@ pub(crate) fn write(
         let tile = ((y >> histo_bits) * histo_xsize + (x >> histo_bits)) as usize;
         ((histogram_symbols[tile] >> 8) & 0xffff) as usize
     };
-    // A literal's four codes and lengths as one word each, in order green, red, blue, alpha.
-    let literal_tables: Vec<[[u32; 256]; 4]> = huffman_codes
-        .chunks_exact(5)
-        .map(|c| {
-            let mut t = [[0u32; 256]; 4];
-            for (k, code) in c[..4].iter().enumerate() {
-                for s in 0..256 {
-                    t[k][s] = u32::from(code.codes[s]) | u32::from(code.code_lengths[s]) << 16;
-                }
-            }
-            t
-        })
-        .collect();
+    let literal_tables = literal_tables(huffman_codes);
     let mut w = std::mem::take(bw);
     walk(argb, width, histo_bits, copies, |run| match run {
         Run::Literals(x, y, pixels) => {
