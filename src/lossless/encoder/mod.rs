@@ -98,6 +98,9 @@ pub(crate) struct FastMode {
     pub(crate) pred_subset: bool,
     /// One predictor for every tile with no search, as libwebp's method 0.
     pub(crate) pred_single: bool,
+    /// Only the LZ77 references are tried where libwebp also tries run-length (and box) ones,
+    /// each with its own cache-size search and entropy estimate.
+    pub(crate) one_lz77: bool,
 }
 
 impl FastMode {
@@ -112,6 +115,7 @@ impl FastMode {
                 no_cache: set.contains("cache"),
                 pred_subset: set.contains("subset"),
                 pred_single: set.contains("single"),
+                one_lz77: set.contains("lz77"),
             };
         }
         Self {
@@ -121,6 +125,7 @@ impl FastMode {
             no_cache: false,
             pred_subset: on && method != 0,
             pred_single: false,
+            one_lz77: false,
         }
     }
 }

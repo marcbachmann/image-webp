@@ -740,6 +740,9 @@ pub(crate) fn get_backward_references(
         backward_references_2d_locality(width, &mut refs.best);
         return 0;
     }
+    if fast.one_lz77 && lz77_types_to_try & LZ77_STANDARD != 0 {
+        lz77_types_to_try = LZ77_STANDARD;
+    }
     let mut histo = Histogram::new(MAX_COLOR_CACHE_BITS);
     let mut lz77_types_best = [0u32; 2];
     let mut bit_costs_best = [u64::MAX; 2];
