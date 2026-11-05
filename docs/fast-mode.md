@@ -57,5 +57,11 @@ instead of libwebp's 14. Bytes within 0.2% either way, 15-36% faster: in the `fa
 at methods 1 to 6. `pred_single`: libwebp's method-0 predictor (select) for every tile with
 no search; a knob only.
 
+`one_lz77`: only the LZ77 candidate where libwebp also builds a run-length one, each with
+its own cache-size search and entropy estimate. Bytes at method 4 on top of `short_chain` and
+`pred_subset`: RGB photo 4,801,932 B (-0.25%), RGBA photo 1,861,070 B (+4.6%), graphic the
+same. Time read on a loaded host (not comparable with the rows above): graphic -10%, RGBA
+photo -2..4%. A knob only, because of the RGBA photo.
+
 `run_refs` above method 0 is not in the `fast_mode` set: 3.6x on photos at identical bytes,
 but +5% on the RGBA photo and 3.8x on the graphic.
