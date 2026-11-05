@@ -722,10 +722,35 @@ fn get_combine_cost_factor(histo_size: usize, quality: i32) -> i32 {
 
 /// `VP8LGetHistoImageSymbols`: the clustered histograms, with each tile's cluster in
 /// `histogram_symbols`.
+/// Adds `refs` to the `histogram_bits` tile histograms of an `xsize` wide image.
+pub(crate) fn fill_from_refs(
+    refs: impl IntoIterator<Item = PixOrCopy>,
+    xsize: u32,
+    histogram_bits: u32,
+    histos: &mut [Histogram],
+) {
+    let histo_xsize = if histogram_bits > 0 {
+        sub_sample_size(xsize, histogram_bits)
+    } else {
+        1
+    };
+    let (mut x, mut y) = (0u32, 0u32);
+    for v in refs {
+        let ix = ((y >> histogram_bits) * histo_xsize + (x >> histogram_bits)) as usize;
+        histos[ix].add_single(&v, None);
+        x += u32::from(v.len);
+        while x >= xsize {
+            x -= xsize;
+            y += 1;
+        }
+    }
+}
+
+/// `fill` adds the image to the tile histograms it is given.
 pub(crate) fn get_histo_image_symbols(
     xsize: u32,
     ysize: u32,
-    refs: impl IntoIterator<Item = PixOrCopy>,
+    fill: impl FnOnce(&mut [Histogram]),
     quality: i32,
     low_effort: bool,
     histogram_bits: u32,
@@ -747,18 +772,7 @@ pub(crate) fn get_histo_image_symbols(
     for h in orig.iter_mut() {
         h.zero();
     }
-    {
-        let (mut x, mut y) = (0u32, 0u32);
-        for v in refs {
-            let ix = ((y >> histogram_bits) * histo_xsize + (x >> histogram_bits)) as usize;
-            orig[ix].add_single(&v, None);
-            x += u32::from(v.len);
-            while x >= xsize {
-                x -= xsize;
-                y += 1;
-            }
-        }
-    }
+    fill(&mut orig);
     let mut orig_used = vec![true; raw_size];
     let mut image: Vec<Histogram> = Vec::new();
     for (i, h) in orig.iter_mut().enumerate() {

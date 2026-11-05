@@ -93,7 +93,7 @@ fn vector_mismatch(a: &[u32], b: &[u32], length: usize) -> usize {
 
 /// Mismatch index of `argb[p1..]` and `argb[p2..]`, 0 if they differ at `best_len_match`.
 #[inline]
-fn find_match_length(
+pub(crate) fn find_match_length(
     argb: &[u32],
     p1: usize,
     p2: usize,
@@ -333,7 +333,7 @@ fn get_window_size_for_hash_chain(quality: i32, xsize: u32) -> u32 {
 }
 
 #[inline]
-fn max_find_copy_length(len: u32) -> u32 {
+pub(crate) fn max_find_copy_length(len: u32) -> u32 {
     len.min(MAX_LENGTH)
 }
 
@@ -394,65 +394,6 @@ fn backward_references_rle(
             add_single_literal(argb[i], &mut cache, refs);
             i += 1;
         }
-    }
-}
-
-/// The backward references of the fast mode, found as they are read: a pixel that repeats
-/// neither its left nor its upper neighbour is a literal, a run of either is a copy, with no
-/// colour cache. A pure function of the pixels, so the histograms and the writer read it
-/// twice instead of holding a reference per pixel.
-#[derive(Clone)]
-pub(crate) struct Runs<'a> {
-    argb: &'a [u32],
-    xsize: usize,
-    i: usize,
-    /// The plane codes of the distances 1 and `xsize`.
-    left: u32,
-    up: u32,
-}
-
-impl<'a> Runs<'a> {
-    pub(crate) fn new(argb: &'a [u32], xsize: u32) -> Self {
-        Self {
-            argb,
-            xsize: xsize as usize,
-            i: 0,
-            left: distance_to_plane_code(xsize, 1),
-            up: distance_to_plane_code(xsize, xsize),
-        }
-    }
-}
-
-impl Iterator for Runs<'_> {
-    type Item = PixOrCopy;
-
-    #[inline]
-    fn next(&mut self) -> Option<PixOrCopy> {
-        let (argb, xsize, i) = (self.argb, self.xsize, self.i);
-        if i >= argb.len() {
-            return None;
-        }
-        let p = argb[i];
-        if i == 0 || (p != argb[i - 1] && (i < xsize || p != argb[i - xsize])) {
-            self.i = i + 1;
-            return Some(PixOrCopy::literal(p));
-        }
-        let max_len = max_find_copy_length((argb.len() - i) as u32) as usize;
-        let rle_len = find_match_length(argb, i, i - 1, 0, max_len);
-        let prev_row_len = if i < xsize {
-            0
-        } else {
-            find_match_length(argb, i, i - xsize, 0, max_len)
-        };
-        let v = if rle_len >= prev_row_len && rle_len >= MIN_LENGTH as usize {
-            PixOrCopy::copy(self.left, rle_len as u32)
-        } else if prev_row_len >= MIN_LENGTH as usize {
-            PixOrCopy::copy(self.up, prev_row_len as u32)
-        } else {
-            PixOrCopy::literal(p)
-        };
-        self.i = i + usize::from(v.len);
-        Some(v)
     }
 }
 

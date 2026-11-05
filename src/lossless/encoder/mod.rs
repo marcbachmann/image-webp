@@ -12,6 +12,7 @@ mod backward_refs;
 mod bit_writer;
 mod cost;
 mod entropy;
+mod fast;
 mod histogram;
 mod huffman;
 mod near_lossless;
@@ -34,7 +35,7 @@ pub(crate) use alpha::encode_alpha_filtered;
 use std::borrow::Cow;
 
 use backward_refs::{
-    PixOrCopy, Runs,
+    PixOrCopy,
     get_backward_references, BackwardRefs, HashChain, PixOrCopyMode, RefsSet, LZ77_BOX, LZ77_RLE,
     LZ77_STANDARD,
 };
@@ -1031,7 +1032,7 @@ fn encode_image_internal(
         let mut w = init;
         encode_refs(
             &mut w,
-            Runs::new(argb, width),
+            Source::<std::iter::Empty<PixOrCopy>>::Fast(argb),
             width,
             height,
             quality,
@@ -1071,7 +1072,7 @@ fn encode_image_internal(
             };
             encode_refs(
                 &mut w,
-                refs_i.iter().copied(),
+                Source::Refs(refs_i.iter().copied()),
                 width,
                 height,
                 quality,
@@ -1093,12 +1094,19 @@ fn encode_image_internal(
     *bw = best.unwrap();
 }
 
+/// What an entropy-coded image is made from: backward references, or in the fast mode the
+/// pixels themselves, read as runs.
+enum Source<'a, I> {
+    Refs(I),
+    Fast(&'a [u32]),
+}
+
 /// The entropy-coded image of one set of backward references: the histogram image, the
 /// Huffman codes and the symbols, appended to `w`.
 #[allow(clippy::too_many_arguments)]
 fn encode_refs<I: Iterator<Item = PixOrCopy> + Clone>(
     w: &mut BitWriter,
-    refs_i: I,
+    source: Source<'_, I>,
     width: u32,
     height: u32,
     quality: i32,
@@ -1113,7 +1121,12 @@ fn encode_refs<I: Iterator<Item = PixOrCopy> + Clone>(
             let mut histogram_image = get_histo_image_symbols(
                 width,
                 height,
-                refs_i.clone(),
+                |histos| match &source {
+                    Source::Refs(refs) => {
+                        histogram::fill_from_refs(refs.clone(), width, histogram_bits, histos)
+                    }
+                    Source::Fast(argb) => fast::count(argb, width, histogram_bits, histos),
+                },
                 quality,
                 low_effort,
                 histogram_bits,
@@ -1162,14 +1175,14 @@ fn encode_refs<I: Iterator<Item = PixOrCopy> + Clone>(
                 );
             }
             store_huffman_codes(w, &mut codes[..5 * histogram_image_size as usize]);
-            store_image_to_bit_mask(
-                w,
-                width,
-                histogram_bits,
-                refs_i,
-                histogram_argb,
-                &codes,
-            );
+            match source {
+                Source::Refs(refs) => {
+                    store_image_to_bit_mask(w, width, histogram_bits, refs, histogram_argb, &codes)
+                }
+                Source::Fast(argb) => {
+                    fast::write(w, argb, width, histogram_bits, histogram_argb, &codes)
+                }
+            }
 }
 
 /// `VP8LEncodeStream`: the transforms and entropy-coded image of `argb`, appended to `bw`.
