@@ -230,6 +230,9 @@ impl HashChain {
         // links in flight; the moment one of them stops, the other goes on alone. A chain only
         // reaches positions below its own, which the backward pass has not written yet, and the
         // results are applied in the original order, so the output is that of one walk at a time.
+        // Short walks (quality 0 to 55: 8 to 31 candidates) lose more
+        // to the pair's bookkeeping than they gain.
+        let pair = iter_max >= PAIR_MIN_ITERS;
         let mut base_position = size as u32 - 2;
         while base_position > 0 {
             let mut a = Walk::start(
@@ -242,7 +245,7 @@ impl HashChain {
                 iter_max,
                 low_effort,
             );
-            if base_position >= 2 {
+            if pair && base_position >= 2 {
                 let mut b = Walk::start(
                     ol,
                     argb,
@@ -265,6 +268,9 @@ impl HashChain {
         }
     }
 }
+
+/// The chain effort from which [`HashChain::fill`] walks two positions in lockstep.
+const PAIR_MIN_ITERS: i32 = 32;
 
 /// One position's chain walk in [`HashChain::fill`]: the best match so far and where it stands.
 #[derive(Clone, Copy)]
