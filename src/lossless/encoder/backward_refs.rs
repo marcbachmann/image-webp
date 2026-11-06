@@ -225,84 +225,257 @@ impl HashChain {
         let ol = &mut self.offset_length;
         ol[0] = 0;
         ol[size - 1] = 0;
+        // Each candidate of a walk costs the load of the previous one's chain link, at L3 latency
+        // once the chain outgrows L2, so two neighbouring positions walk in lockstep with both
+        // links in flight; the moment one of them stops, the other goes on alone. A chain only
+        // reaches positions below its own, which the backward pass has not written yet, and the
+        // results are applied in the original order, so the output is that of one walk at a time.
         let mut base_position = size as u32 - 2;
         while base_position > 0 {
-            let max_len = max_find_copy_length(size as u32 - 1 - base_position) as usize;
-            let bp = base_position as usize;
-            let mut iter = iter_max;
-            let mut best_length = 0usize;
-            let mut best_distance = 0u32;
-            let min_pos: i32 = if base_position > window_size {
-                (base_position - window_size) as i32
-            } else {
-                0
-            };
-            let length_max = max_len.min(256);
-            let mut pos = ol[bp] as i32;
-            if !low_effort {
-                if base_position >= xsize {
-                    let curr_length =
-                        find_match_length(argb, bp - xsize as usize, bp, best_length, max_len);
-                    if curr_length > best_length {
-                        best_length = curr_length;
-                        best_distance = xsize;
-                    }
-                    iter -= 1;
+            let mut a = Walk::start(
+                ol,
+                argb,
+                base_position,
+                size,
+                xsize,
+                window_size,
+                iter_max,
+                low_effort,
+            );
+            if base_position >= 2 {
+                let mut b = Walk::start(
+                    ol,
+                    argb,
+                    base_position - 1,
+                    size,
+                    xsize,
+                    window_size,
+                    iter_max,
+                    low_effort,
+                );
+                walk_pair(ol, argb, &mut a, &mut b);
+                apply(ol, argb, &mut base_position, a.best_length, a.best_distance);
+                if base_position == b.bp as u32 {
+                    apply(ol, argb, &mut base_position, b.best_length, b.best_distance);
                 }
-                let curr_length = find_match_length(argb, bp - 1, bp, best_length, max_len);
+            } else {
+                walk_rest(ol, argb, &mut a);
+                apply(ol, argb, &mut base_position, a.best_length, a.best_distance);
+            }
+        }
+    }
+}
+
+/// One position's chain walk in [`HashChain::fill`]: the best match so far and where it stands.
+#[derive(Clone, Copy)]
+struct Walk {
+    bp: usize,
+    pos: i32,
+    min_pos: i32,
+    iter: i32,
+    max_len: usize,
+    length_max: usize,
+    best_length: usize,
+    best_distance: u32,
+    best_argb: u32,
+}
+
+impl Walk {
+    /// libwebp's head of the walk: the two fixed candidates (one row up, one left), then the
+    /// chain from this position's link.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    fn start(
+        ol: &[u32],
+        argb: &[u32],
+        base_position: u32,
+        size: usize,
+        xsize: u32,
+        window_size: u32,
+        iter_max: i32,
+        low_effort: bool,
+    ) -> Walk {
+        let max_len = max_find_copy_length(size as u32 - 1 - base_position) as usize;
+        let bp = base_position as usize;
+        let mut iter = iter_max;
+        let mut best_length = 0usize;
+        let mut best_distance = 0u32;
+        let min_pos: i32 = if base_position > window_size {
+            (base_position - window_size) as i32
+        } else {
+            0
+        };
+        let mut pos = ol[bp] as i32;
+        if !low_effort {
+            if base_position >= xsize {
+                let curr_length =
+                    find_match_length(argb, bp - xsize as usize, bp, best_length, max_len);
                 if curr_length > best_length {
                     best_length = curr_length;
-                    best_distance = 1;
+                    best_distance = xsize;
                 }
                 iter -= 1;
-                if best_length == MAX_LENGTH as usize {
-                    pos = min_pos - 1;
+            }
+            let curr_length = find_match_length(argb, bp - 1, bp, best_length, max_len);
+            if curr_length > best_length {
+                best_length = curr_length;
+                best_distance = 1;
+            }
+            iter -= 1;
+            if best_length == MAX_LENGTH as usize {
+                pos = min_pos - 1;
+            }
+        }
+        Walk {
+            bp,
+            pos,
+            min_pos,
+            iter,
+            max_len,
+            length_max: max_len.min(256),
+            best_length,
+            best_distance,
+            best_argb: argb[bp + best_length],
+        }
+    }
+}
+
+/// The rest of one walk, as libwebp's loop.
+#[inline(always)]
+fn walk_rest(ol: &[u32], argb: &[u32], w: &mut Walk) {
+    while w.pos >= w.min_pos && {
+        w.iter -= 1;
+        w.iter != 0
+    } {
+        let p = w.pos as usize;
+        if argb[p + w.best_length] == w.best_argb {
+            let curr_length = vector_mismatch(&argb[p..], &argb[w.bp..], w.max_len);
+            if w.best_length < curr_length {
+                w.best_length = curr_length;
+                w.best_distance = (w.bp - p) as u32;
+                w.best_argb = argb[w.bp + curr_length];
+                if curr_length >= w.length_max {
+                    break;
                 }
             }
-            let mut best_argb = argb[bp + best_length];
-            while pos >= min_pos && {
-                iter -= 1;
-                iter != 0
-            } {
-                let p = pos as usize;
-                if argb[p + best_length] == best_argb {
-                    let curr_length = vector_mismatch(&argb[p..], &argb[bp..], max_len);
-                    if best_length < curr_length {
-                        best_length = curr_length;
-                        best_distance = base_position - pos as u32;
-                        best_argb = argb[bp + best_length];
-                        if best_length >= length_max {
-                            break;
-                        }
+        }
+        w.pos = ol[p] as i32;
+    }
+}
+
+/// Two walks in lockstep until one of them stops, then the other alone.
+#[inline(always)]
+fn walk_pair(ol: &[u32], argb: &[u32], a: &mut Walk, b: &mut Walk) {
+    let (mut pa, mut pb) = (a.pos, b.pos);
+    let (mut ia, mut ib) = (a.iter, b.iter);
+    let (mut la, mut lb) = (a.best_length, b.best_length);
+    let (mut aa, mut ab) = (a.best_argb, b.best_argb);
+    let (mut da, mut db) = (a.best_distance, b.best_distance);
+    loop {
+        // `a` stops: `b` has not taken this step yet.
+        if pa < a.min_pos || {
+            ia -= 1;
+            ia == 0
+        } {
+            (a.best_length, a.best_distance) = (la, da);
+            (b.pos, b.iter, b.best_length, b.best_argb, b.best_distance) = (pb, ib, lb, ab, db);
+            return walk_rest(ol, argb, b);
+        }
+        let qa = pa as usize;
+        let na = ol[qa];
+        // `b` stops: `a` has taken its condition, so its body finishes here.
+        if pb < b.min_pos || {
+            ib -= 1;
+            ib == 0
+        } {
+            (b.best_length, b.best_distance) = (lb, db);
+            if argb[qa + la] == aa {
+                let curr_length = vector_mismatch(&argb[qa..], &argb[a.bp..], a.max_len);
+                if la < curr_length {
+                    (la, da, aa) = (curr_length, (a.bp - qa) as u32, argb[a.bp + curr_length]);
+                    if curr_length >= a.length_max {
+                        (a.best_length, a.best_distance) = (la, da);
+                        return;
                     }
                 }
-                pos = ol[p] as i32;
             }
-            let mut max_base_position = base_position;
-            loop {
-                ol[base_position as usize] =
-                    (best_distance << MAX_LENGTH_BITS) | best_length as u32;
-                base_position -= 1;
-                if best_distance == 0 || base_position == 0 {
-                    break;
-                }
-                if base_position < best_distance
-                    || argb[(base_position - best_distance) as usize]
-                        != argb[base_position as usize]
-                {
-                    break;
-                }
-                if best_length == MAX_LENGTH as usize
-                    && best_distance != 1
-                    && base_position + MAX_LENGTH < max_base_position
-                {
-                    break;
-                }
-                if best_length < MAX_LENGTH as usize {
-                    best_length += 1;
-                    max_base_position = base_position;
+            (a.pos, a.iter, a.best_length, a.best_argb, a.best_distance) =
+                (na as i32, ia, la, aa, da);
+            return walk_rest(ol, argb, a);
+        }
+        let qb = pb as usize;
+        let nb = ol[qb];
+        let (ha, hb) = (argb[qa + la] == aa, argb[qb + lb] == ab);
+        if ha {
+            let curr_length = vector_mismatch(&argb[qa..], &argb[a.bp..], a.max_len);
+            if la < curr_length {
+                (la, da, aa) = (curr_length, (a.bp - qa) as u32, argb[a.bp + curr_length]);
+                if curr_length >= a.length_max {
+                    (a.best_length, a.best_distance) = (la, da);
+                    (b.pos, b.iter, b.best_length, b.best_argb, b.best_distance) =
+                        (pb, ib, lb, ab, db);
+                    // `b` has taken its condition and not its body.
+                    if hb {
+                        let curr_length = vector_mismatch(&argb[qb..], &argb[b.bp..], b.max_len);
+                        if lb < curr_length {
+                            (b.best_length, b.best_distance, b.best_argb) =
+                                (curr_length, (b.bp - qb) as u32, argb[b.bp + curr_length]);
+                            if curr_length >= b.length_max {
+                                return;
+                            }
+                        }
+                    }
+                    b.pos = nb as i32;
+                    return walk_rest(ol, argb, b);
                 }
             }
+        }
+        if hb {
+            let curr_length = vector_mismatch(&argb[qb..], &argb[b.bp..], b.max_len);
+            if lb < curr_length {
+                (lb, db, ab) = (curr_length, (b.bp - qb) as u32, argb[b.bp + curr_length]);
+                if curr_length >= b.length_max {
+                    (b.best_length, b.best_distance) = (lb, db);
+                    (a.pos, a.iter, a.best_length, a.best_argb, a.best_distance) =
+                        (na as i32, ia, la, aa, da);
+                    return walk_rest(ol, argb, a);
+                }
+            }
+        }
+        (pa, pb) = (na as i32, nb as i32);
+    }
+}
+
+/// Writes a position's match and carries it down over the positions it also covers, as libwebp.
+#[inline(always)]
+fn apply(
+    ol: &mut [u32],
+    argb: &[u32],
+    base_position: &mut u32,
+    mut best_length: usize,
+    best_distance: u32,
+) {
+    let mut max_base_position = *base_position;
+    loop {
+        ol[*base_position as usize] = (best_distance << MAX_LENGTH_BITS) | best_length as u32;
+        *base_position -= 1;
+        if best_distance == 0 || *base_position == 0 {
+            break;
+        }
+        if *base_position < best_distance
+            || argb[(*base_position - best_distance) as usize] != argb[*base_position as usize]
+        {
+            break;
+        }
+        if best_length == MAX_LENGTH as usize
+            && best_distance != 1
+            && *base_position + MAX_LENGTH < max_base_position
+        {
+            break;
+        }
+        if best_length < MAX_LENGTH as usize {
+            best_length += 1;
+            max_base_position = *base_position;
         }
     }
 }
