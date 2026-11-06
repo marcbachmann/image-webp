@@ -927,26 +927,39 @@ struct Parsed {
     mbs: Vec<(MacroBlock, [u8; 24])>,
     coeffs: Vec<i16>,
     error: Option<DecodingError>,
+    /// Macroblocks and coefficients the unit holds at most, half its bytes each.
+    mbs_cap: usize,
+    coeffs_cap: usize,
 }
 
-/// The bytes a [`Parsed`] unit holds: half of them for macroblocks, half for coefficients.
-const PARSED_UNIT_BYTES: usize = 16 << 10;
-const PARSED_MBS: usize = PARSED_UNIT_BYTES / 2 / std::mem::size_of::<(MacroBlock, [u8; 24])>();
-const PARSED_COEFFS: usize = PARSED_UNIT_BYTES / 2 / 2;
+/// The bytes a [`Parsed`] unit holds, half for macroblocks and half for coefficients: what a row
+/// of macroblocks with every coefficient would take, within these bounds, so with the usual sparse
+/// blocks a unit holds a row or more. The reconstructing thread sleeps once per unit while the
+/// parser is behind, and at 16 KiB a dense 6000 px frame woke it two thousand times a decode, a
+/// fifth of its CPU; splitting the bytes by what a full macroblock takes instead holds fewer of
+/// the sparse ones and woke it twice as often.
+const PARSED_UNIT_BYTES: std::ops::RangeInclusive<usize> = (16 << 10)..=(256 << 10);
+
+fn parsed_unit_bytes(mbwidth: usize) -> usize {
+    let row = mbwidth * (std::mem::size_of::<(MacroBlock, [u8; 24])>() + 384 * 2);
+    row.clamp(*PARSED_UNIT_BYTES.start(), *PARSED_UNIT_BYTES.end())
+}
 
 impl Parsed {
-    /// Empties the unit, sized for [`PARSED_UNIT_BYTES`] so that it never grows.
-    fn reset(&mut self) {
+    /// Empties the unit, sized for `bytes` so that it never grows.
+    fn reset(&mut self, bytes: usize) {
         self.mbs.clear();
         self.coeffs.clear();
         self.error = None;
-        self.mbs.reserve_exact(PARSED_MBS);
-        self.coeffs.reserve_exact(PARSED_COEFFS);
+        self.mbs_cap = bytes / 2 / std::mem::size_of::<(MacroBlock, [u8; 24])>();
+        self.coeffs_cap = bytes / 2 / 2;
+        self.mbs.reserve_exact(self.mbs_cap);
+        self.coeffs.reserve_exact(self.coeffs_cap);
     }
 
     /// Whether the unit holds another macroblock whatever its coefficients.
     fn has_room(&self) -> bool {
-        self.mbs.len() < PARSED_MBS && self.coeffs.len() + 384 <= PARSED_COEFFS
+        self.mbs.len() < self.mbs_cap && self.coeffs.len() + 384 <= self.coeffs_cap
     }
 
     /// Adds a macroblock, moving its coefficients out of `blocks`, which it clears as the
@@ -996,7 +1009,7 @@ impl Produce for Parser {
         }
         let modes = self.modes.as_deref_mut()?;
         let mut unit = spare.unwrap_or_default();
-        unit.reset();
+        unit.reset(parsed_unit_bytes(mbwidth));
         let mut blocks = [0i16; 384];
         while self.mby < mbheight && unit.has_room() {
             if self.mbx == 0 {
@@ -1281,7 +1294,7 @@ impl<'a, const BPP: usize> BandDecoder<'a, BPP> {
         }
         let mbwidth = usize::from(self.dec.mbwidth);
         let modes = mode_unit_rows(mbwidth) * mbwidth * std::mem::size_of::<MacroBlock>();
-        (ahead.max(1) + 2) * (PARSED_UNIT_BYTES + modes)
+        (ahead.max(1) + 2) * (parsed_unit_bytes(mbwidth) + modes)
     }
 
     /// Decodes macroblock rows until a band of rows is final and returns its first row and
