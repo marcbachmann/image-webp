@@ -230,9 +230,11 @@ impl HashChain {
         // links in flight; the moment one of them stops, the other goes on alone. A chain only
         // reaches positions below its own, which the backward pass has not written yet, and the
         // results are applied in the original order, so the output is that of one walk at a time.
-        // Short walks (quality 0 to 55: 8 to 31 candidates) lose more
-        // to the pair's bookkeeping than they gain.
-        let pair = iter_max >= PAIR_MIN_ITERS;
+        // Short walks (quality 0 to 55: 8 to 31 candidates) lose more to the pair's bookkeeping
+        // than they gain, so they take libwebp's loop as it is.
+        if iter_max < PAIR_MIN_ITERS {
+            return fill_single(ol, argb, size, xsize, window_size, iter_max, low_effort);
+        }
         let mut base_position = size as u32 - 2;
         while base_position > 0 {
             let mut a = Walk::start(
@@ -245,7 +247,7 @@ impl HashChain {
                 iter_max,
                 low_effort,
             );
-            if pair && base_position >= 2 {
+            if base_position >= 2 {
                 let mut b = Walk::start(
                     ol,
                     argb,
@@ -264,6 +266,96 @@ impl HashChain {
             } else {
                 walk_rest(ol, argb, &mut a);
                 apply(ol, argb, &mut base_position, a.best_length, a.best_distance);
+            }
+        }
+    }
+}
+
+/// `VP8LHashChainFill`'s backward pass, one walk at a time.
+#[allow(clippy::too_many_arguments)]
+fn fill_single(
+    ol: &mut [u32],
+    argb: &[u32],
+    size: usize,
+    xsize: u32,
+    window_size: u32,
+    iter_max: i32,
+    low_effort: bool,
+) {
+    let mut base_position = size as u32 - 2;
+    while base_position > 0 {
+        let max_len = max_find_copy_length(size as u32 - 1 - base_position) as usize;
+        let bp = base_position as usize;
+        let mut iter = iter_max;
+        let mut best_length = 0usize;
+        let mut best_distance = 0u32;
+        let min_pos: i32 = if base_position > window_size {
+            (base_position - window_size) as i32
+        } else {
+            0
+        };
+        let length_max = max_len.min(256);
+        let mut pos = ol[bp] as i32;
+        if !low_effort {
+            if base_position >= xsize {
+                let curr_length =
+                    find_match_length(argb, bp - xsize as usize, bp, best_length, max_len);
+                if curr_length > best_length {
+                    best_length = curr_length;
+                    best_distance = xsize;
+                }
+                iter -= 1;
+            }
+            let curr_length = find_match_length(argb, bp - 1, bp, best_length, max_len);
+            if curr_length > best_length {
+                best_length = curr_length;
+                best_distance = 1;
+            }
+            iter -= 1;
+            if best_length == MAX_LENGTH as usize {
+                pos = min_pos - 1;
+            }
+        }
+        let mut best_argb = argb[bp + best_length];
+        while pos >= min_pos && {
+            iter -= 1;
+            iter != 0
+        } {
+            let p = pos as usize;
+            if argb[p + best_length] == best_argb {
+                let curr_length = vector_mismatch(&argb[p..], &argb[bp..], max_len);
+                if best_length < curr_length {
+                    best_length = curr_length;
+                    best_distance = base_position - pos as u32;
+                    best_argb = argb[bp + best_length];
+                    if best_length >= length_max {
+                        break;
+                    }
+                }
+            }
+            pos = ol[p] as i32;
+        }
+        let mut max_base_position = base_position;
+        loop {
+            ol[base_position as usize] = (best_distance << MAX_LENGTH_BITS) | best_length as u32;
+            base_position -= 1;
+            if best_distance == 0 || base_position == 0 {
+                break;
+            }
+            if base_position < best_distance
+                || argb[(base_position - best_distance) as usize] != argb[base_position as usize]
+            {
+                break;
+            }
+            if best_length == MAX_LENGTH as usize
+                && best_distance != 1
+                && base_position + MAX_LENGTH < max_base_position
+            {
+                break;
+            }
+            if best_length < MAX_LENGTH as usize {
+                best_length += 1;
+                max_base_position = base_position;
             }
         }
     }
