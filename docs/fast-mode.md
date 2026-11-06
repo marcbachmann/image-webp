@@ -3,8 +3,8 @@
 `EncoderParams::fast_mode` trades byte parity with libwebp for speed. Each shortcut is a
 `lossless::encoder::FastMode` field of its own so that any can be offered by itself; the
 `fast_mode` flag turns on the set that measured best per method, `FastMode::for_method`.
-`IMAGE_WEBP_FAST_SET=run,chain,trace,cache,subset,single,lz77` (any subset of those words)
-overrides that set, for measuring a knob on its own.
+To measure a knob on its own, set it in `FastMode::for_method` (the knobs were measured through an
+environment override, removed because a library must not read the environment on a caller's thread).
 
 Measured on the x86 worker (i9-13900, pinned, min of 3 interleaved runs), 6 MP inputs:
 `tests/reference/gallery1/3.png` resized to 3000x2000 (RGB photo), the same with the alpha

@@ -106,18 +106,6 @@ pub(crate) struct FastMode {
 impl FastMode {
     /// What `fast_mode` turns on at `method`.
     pub(crate) fn for_method(on: bool, method: i32) -> Self {
-        let env = std::env::var("IMAGE_WEBP_FAST_SET").ok();
-        if let Some(set) = env.filter(|_| on) {
-            return Self {
-                run_refs: set.contains("run"),
-                short_chain: set.contains("chain"),
-                no_trace: set.contains("trace"),
-                no_cache: set.contains("cache"),
-                pred_subset: set.contains("subset"),
-                pred_single: set.contains("single"),
-                one_lz77: set.contains("lz77"),
-            };
-        }
         Self {
             run_refs: on && method == 0,
             short_chain: on && method != 0,
