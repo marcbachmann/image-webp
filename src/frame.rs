@@ -630,6 +630,21 @@ struct ScaledLossy<'a> {
     done: bool,
 }
 
+/// A row into its plane's rescaler, and the rows that finishes onto the plane's queue in buffers from `spare`.
+fn push_row(scaler: &mut Rescaler, queue: &mut VecDeque<Vec<u8>>, spare: &mut Vec<Vec<u8>>, row: &[u8]) {
+    let mut drain = |r: &mut Rescaler| {
+        while r.has_pending_output() {
+            let mut out = spare.pop().unwrap_or_default();
+            out.resize(r.dst_row_len(), 0);
+            r.export(&mut out);
+            queue.push_back(out);
+        }
+    };
+    drain(scaler);
+    scaler.import(row);
+    drain(scaler);
+}
+
 impl<'a> ScaledLossy<'a> {
     fn new(bands: BandDecoder<'a, 3>, alpha: Option<Alpha<'a>>, keep_alpha: bool, (w, h): (u32, u32), (ow, oh): (u32, u32), bpp: usize) -> Self {
         let (w, h, ow, oh) = (w as usize, h as usize, ow as usize, oh as usize);
@@ -655,19 +670,7 @@ impl<'a> ScaledLossy<'a> {
     }
 
     fn push(&mut self, plane: usize, row: &[u8]) {
-        self.drain(plane);
-        self.scalers[plane].import(row);
-        self.drain(plane);
-    }
-
-    fn drain(&mut self, plane: usize) {
-        let r = &mut self.scalers[plane];
-        while r.has_pending_output() {
-            let mut out = self.spare.pop().unwrap_or_default();
-            out.resize(r.dst_row_len(), 0);
-            r.export(&mut out);
-            self.queues[plane].push_back(out);
-        }
+        push_row(&mut self.scalers[plane], &mut self.queues[plane], &mut self.spare, row);
     }
 
     fn ready(&self) -> usize {
@@ -707,20 +710,15 @@ impl<'a> ScaledLossy<'a> {
             if self.done {
                 return Ok(None);
             }
-            let mut rows: [Vec<Vec<u8>>; 3] = Default::default();
+            let (scalers, queues, spare) = (&mut self.scalers, &mut self.queues, &mut self.spare);
             let end = self.bands.next_planes(|plane, row| {
                 let p = match plane {
                     Channel::Y => 0,
                     Channel::U => 1,
                     Channel::V => 2,
                 };
-                rows[p].push(row.to_vec());
+                push_row(&mut scalers[p], &mut queues[p], spare, row);
             })?;
-            for (p, rows) in rows.iter().enumerate() {
-                for row in rows {
-                    self.push(p, row);
-                }
-            }
             match end {
                 None => self.done = true,
                 Some(end) => {
