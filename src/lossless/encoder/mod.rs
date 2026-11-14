@@ -1465,6 +1465,49 @@ mod tests {
         }
     }
 
+    /// Each plane and image coded in buffers filled past its size with what no coding writes
+    /// comes out as coded alone: a coding reads none of what its kept buffers held before.
+    #[test]
+    fn codings_in_poisoned_buffers_match_codings_alone() {
+        let mut rng = StdRng::seed_from_u64(9);
+        let sizes = [(1, 1), (2, 1), (3, 1), (1, 40), (130, 1), (5, 3), (37, 23), (90, 61)];
+        for (w, h) in sizes {
+            let blobs = (0..w * h).map(|i| {
+                let (x, y) = ((i % w) as i32 - w as i32 / 2, (i / w) as i32 - h as i32 / 3);
+                (255 - (x * x + y * y).min(255)) as u8
+            });
+            let levels = (0..w * h).map(|_| rng.gen_range(0..6u8) * 50).collect::<Vec<_>>();
+            for p in [blobs.collect::<Vec<_>>(), levels] {
+                let argb: Vec<u32> = p
+                    .iter()
+                    .map(|&a| u32::from(a) << 24 | u32::from(a / 3) << 16 | u32::from(a ^ 0x55) << 8 | 7)
+                    .collect();
+                for effort in 0..=6 {
+                    let config = |quality| Config {
+                        quality,
+                        method: effort,
+                        exact: false,
+                        use_predictor: true,
+                        near_lossless: 100,
+                        fast: FastMode::default(),
+                    };
+                    let code = |k| match k {
+                        0 => encode_alpha_plane(&p, w as u32, h as u32, effort, true),
+                        1 => encode_alpha_plane(&p, w as u32, h as u32, effort, false),
+                        2 => encode_argb(config(20.), argb.clone(), w as u32, h as u32),
+                        _ => encode_argb(config(75.), argb.clone(), w as u32, h as u32),
+                    };
+                    for k in 0..4 {
+                        let alone = code(k);
+                        let lent = Lent::lend(Kept::poisoned());
+                        assert!(code(k) == alone, "coding {k} {w}x{h} effort {effort}");
+                        drop(lent);
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn far_copies_after_long_codes_decode() {
         let (width, height) = (2048u32, 600u32);

@@ -163,6 +163,28 @@ pub(crate) struct Kept {
     pub(crate) cost: super::cost::CostBuffers,
 }
 
+#[cfg(test)]
+impl Kept {
+    /// Every buffer longer than any test image needs, filled with what no coding writes.
+    pub(crate) fn poisoned() -> Box<Self> {
+        const LEN: usize = 1 << 13;
+        let refs = || RefsSet {
+            best: vec![PixOrCopy::copy(u32::MAX >> 4, 4095); LEN],
+            no_cache: vec![PixOrCopy::literal(0xdead_beef); LEN],
+            tmp: vec![PixOrCopy::cache_idx(1023); LEN],
+            hash_chain_box: HashChain { offset_length: vec![u32::MAX; LEN] },
+        };
+        Box::new(Self {
+            heads: vec![i32::MAX; HASH_SIZE],
+            hash_chain: HashChain { offset_length: vec![u32::MAX; LEN] },
+            refs: refs(),
+            refs_side: refs(),
+            dist: vec![u16::MAX; LEN],
+            cost: super::cost::CostBuffers::poisoned(LEN),
+        })
+    }
+}
+
 thread_local! {
     static LENT: Cell<Option<Box<Kept>>> = const { Cell::new(None) };
 }

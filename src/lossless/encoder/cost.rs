@@ -176,6 +176,25 @@ pub(crate) struct CostBuffers {
     nodes: Option<Box<[CostInterval; NODES]>>,
 }
 
+#[cfg(test)]
+impl CostBuffers {
+    pub(crate) fn poisoned(len: usize) -> Self {
+        let junk = CostInterval {
+            cost: -1,
+            start: 0,
+            end: i32::MAX,
+            index: 0,
+            previous: 0,
+            next: 0,
+        };
+        Self {
+            costs: Some(vec![-1; COST_WINDOW].into_boxed_slice().try_into().unwrap()),
+            cost_cache: vec![-1; len],
+            nodes: Some(Box::new([junk; NODES])),
+        }
+    }
+}
+
 struct CostManager {
     head: u32,
     count: i32,
