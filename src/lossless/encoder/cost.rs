@@ -2,6 +2,7 @@
 //! `enc/backward_references_cost_enc.c`).
 
 use super::backward_refs::{
+    with_kept,
     distance_to_plane_code, BackwardRefs, ColorCache, HashChain, PixOrCopy, MAX_LENGTH,
     MAX_LENGTH_BITS,
 };
@@ -167,6 +168,14 @@ struct CostCacheInterval {
     end: i32,
 }
 
+/// The buffers of a [`CostManager`], kept from one image's coding to the next.
+#[derive(Default)]
+pub(crate) struct CostBuffers {
+    costs: Option<Box<[i64; COST_WINDOW]>>,
+    cost_cache: Vec<i64>,
+    nodes: Option<Box<[CostInterval; NODES]>>,
+}
+
 struct CostManager {
     head: u32,
     count: i32,
@@ -180,11 +189,17 @@ struct CostManager {
 }
 
 impl CostManager {
-    fn new(pix_count: usize, m: &CostModel) -> Self {
+    fn new(pix_count: usize, m: &CostModel, kept: CostBuffers) -> Self {
         let cost_cache_size = pix_count.min(MAX_LENGTH as usize);
-        let cost_cache: Vec<i64> = (0..cost_cache_size)
-            .map(|i| m.length_cost(i as u32))
-            .collect();
+        let mut cost_cache = kept.cost_cache;
+        cost_cache.clear();
+        cost_cache.extend((0..cost_cache_size).map(|i| m.length_cost(i as u32)));
+        let mut costs = kept
+            .costs
+            .unwrap_or_else(|| vec![0; COST_WINDOW].into_boxed_slice().try_into().unwrap());
+        costs.fill(i64::MAX);
+        let mut nodes = kept.nodes.unwrap_or_else(|| Box::new([EMPTY_INTERVAL; NODES]));
+        nodes.fill(EMPTY_INTERVAL);
         let mut cache_intervals = Vec::new();
         let mut cur = CostCacheInterval {
             cost: cost_cache[0],
@@ -208,13 +223,8 @@ impl CostManager {
             count: 0,
             cache_intervals,
             cost_cache,
-            costs: CostWindow(
-                vec![i64::MAX; COST_WINDOW]
-                    .into_boxed_slice()
-                    .try_into()
-                    .unwrap(),
-            ),
-            nodes: Box::new([EMPTY_INTERVAL; NODES]),
+            costs: CostWindow(costs),
+            nodes,
             free: NIL,
             allocated: 0,
         }
@@ -463,7 +473,8 @@ fn distance_only(
     let offset_length = &hash_chain.offset_length[..pix_count];
     let m = CostModel::build(xsize, cache_bits, refs);
     let mut cache = (cache_bits > 0).then(|| ColorCache::new(cache_bits));
-    let mut cm = CostManager::new(pix_count, &m);
+    let kept = with_kept(|k| std::mem::take(&mut k.cost)).unwrap_or_default();
+    let mut cm = CostManager::new(pix_count, &m, kept);
     let mut offset_prev: i64 = -1;
     let mut len_prev: i32 = -1;
     let mut offset_cost: i64 = -1;
@@ -540,6 +551,12 @@ fn distance_only(
         offset_prev = i64::from(offset);
         len_prev = len;
     }
+    let kept = CostBuffers {
+        costs: Some(cm.costs.0),
+        cost_cache: cm.cost_cache,
+        nodes: Some(cm.nodes),
+    };
+    with_kept(|k| k.cost = kept);
 }
 
 /// `VP8LBackwardReferencesTraceBackwards`: the cheapest path through `hash_chain`'s
@@ -554,7 +571,9 @@ pub(crate) fn trace_backwards(
     refs_dst: &mut BackwardRefs,
 ) {
     let size = (xsize * ysize) as usize;
-    let mut dist_array = vec![0u16; size];
+    let mut dist_array = with_kept(|k| std::mem::take(&mut k.dist)).unwrap_or_default();
+    dist_array.clear();
+    dist_array.resize(size, 0);
     distance_only(
         xsize,
         ysize,
@@ -601,4 +620,5 @@ pub(crate) fn trace_backwards(
             i += 1;
         }
     }
+    with_kept(|k| k.dist = dist_array);
 }

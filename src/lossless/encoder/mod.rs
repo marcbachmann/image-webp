@@ -40,7 +40,7 @@ use backward_refs::{
     LZ77_STANDARD,
 };
 use bit_writer::BitWriter;
-pub(crate) use backward_refs::LentHeads;
+pub(crate) use backward_refs::{Kept, Lent};
 use entropy::*;
 use histogram::{get_histo_image_symbols, Histogram};
 use huffman::{
@@ -1247,8 +1247,21 @@ fn encode_stream<P: Pixel>(
         refs: RefsSet::default(),
         refs_side: RefsSet::default(),
     };
+    backward_refs::with_kept(|k| {
+        enc.hash_chain = std::mem::take(&mut k.hash_chain);
+        enc.refs = std::mem::take(&mut k.refs);
+        enc.refs_side = std::mem::take(&mut k.refs_side);
+    });
+    enc.hash_chain.offset_length.clear();
+    enc.refs.clear();
+    enc.refs_side.clear();
     let _ = MAX_PALETTE_SIZE;
     enc.encode_stream(pic, bw);
+    backward_refs::with_kept(|k| {
+        k.hash_chain = enc.hash_chain;
+        k.refs = enc.refs;
+        k.refs_side = enc.refs_side;
+    });
 }
 
 /// `VP8LEncodeImage` minus the RIFF header: the `VP8L` chunk payload of an ARGB image.
@@ -1403,6 +1416,52 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// Planes and images of other sizes and contents coded one after the other in the buffers
+    /// lent to the thread, larger before smaller, come out as each coded alone.
+    #[test]
+    fn codings_in_kept_buffers_match_codings_alone() {
+        let mut rng = StdRng::seed_from_u64(5);
+        let mut planes: Vec<(usize, usize, Vec<u8>)> = vec![];
+        for (w, h) in [(90, 61), (37, 23), (64, 50), (5, 3)] {
+            let blobs = (0..w * h)
+                .map(|i| {
+                    let (x, y) = ((i % w) as i32 - w as i32 / 2, (i / w) as i32 - h as i32 / 3);
+                    (255 - (x * x + y * y).min(255)) as u8
+                })
+                .collect();
+            planes.push((w, h, blobs));
+            planes.push((w, h, (0..w * h).map(|_| rng.gen_range(0..6u8) * 50).collect()));
+        }
+        let config = |method| Config {
+            quality: 75.,
+            method,
+            exact: false,
+            use_predictor: true,
+            near_lossless: 100,
+            fast: FastMode::default(),
+        };
+        let argb = |plane: &[u8]| -> Vec<u32> {
+            plane.iter().map(|&a| u32::from(a) << 24 | u32::from(a / 3) << 16 | u32::from(a ^ 0x55) << 8 | 7).collect()
+        };
+        for effort in [2, 4, 6] {
+            let alone: Vec<_> = planes
+                .iter()
+                .map(|(w, h, p)| {
+                    let alpha = encode_alpha_plane(p, *w as u32, *h as u32, effort, true);
+                    (alpha, encode_argb(config(effort), argb(p), *w as u32, *h as u32))
+                })
+                .collect();
+            let lent = Lent::lend(Box::default());
+            for ((w, h, p), want) in planes.iter().zip(&alone) {
+                let alpha = encode_alpha_plane(p, *w as u32, *h as u32, effort, true);
+                assert!(alpha == want.0, "alpha {w}x{h} effort {effort}");
+                let image = encode_argb(config(effort), argb(p), *w as u32, *h as u32);
+                assert!(image == want.1, "argb {w}x{h} effort {effort}");
+            }
+            drop(lent);
         }
     }
 

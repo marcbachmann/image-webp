@@ -152,30 +152,49 @@ pub(crate) fn hash_pix(argb: u32, shift: u32) -> u32 {
     argb.wrapping_mul(0x1e35a7bd) >> shift
 }
 
+/// The buffers a lossless coding allocates for its image, kept from one coding to the next.
+#[derive(Default)]
+pub(crate) struct Kept {
+    heads: Vec<i32>,
+    pub(crate) hash_chain: HashChain,
+    pub(crate) refs: RefsSet,
+    pub(crate) refs_side: RefsSet,
+    pub(crate) dist: Vec<u16>,
+    pub(crate) cost: super::cost::CostBuffers,
+}
+
 thread_local! {
-    static LENT_HEADS: Cell<Option<Vec<i32>>> = const { Cell::new(None) };
+    static LENT: Cell<Option<Box<Kept>>> = const { Cell::new(None) };
 }
 
-/// A hash heads table the fills on this thread use instead of allocating their own, while it
-/// lives: the megabyte an animation's frames would otherwise map, fault in and unmap each.
-pub(crate) struct LentHeads(Option<Option<Vec<i32>>>);
+/// Buffers the codings on this thread use instead of allocating their own, while it lives: an
+/// animation's frames would otherwise map, fault in and unmap each of them per frame.
+pub(crate) struct Lent(Option<Option<Box<Kept>>>);
 
-impl LentHeads {
-    pub(crate) fn lend(heads: Vec<i32>) -> Self {
-        Self(Some(LENT_HEADS.replace(Some(heads))))
+impl Lent {
+    pub(crate) fn lend(kept: Box<Kept>) -> Self {
+        Self(Some(LENT.replace(Some(kept))))
     }
 
-    pub(crate) fn back(mut self) -> Vec<i32> {
-        LENT_HEADS.replace(self.0.take().unwrap()).unwrap_or_default()
+    pub(crate) fn back(mut self) -> Box<Kept> {
+        LENT.replace(self.0.take().unwrap()).unwrap_or_default()
     }
 }
 
-impl Drop for LentHeads {
+impl Drop for Lent {
     fn drop(&mut self) {
         if let Some(before) = self.0.take() {
-            LENT_HEADS.set(before);
+            LENT.set(before);
         }
     }
+}
+
+/// `f` of the buffers lent to this thread, where there are.
+pub(crate) fn with_kept<R>(f: impl FnOnce(&mut Kept) -> R) -> Option<R> {
+    let mut kept = LENT.take()?;
+    let r = f(&mut kept);
+    LENT.set(Some(kept));
+    Some(r)
 }
 
 /// Best match (offset << 12 | length) at every pixel.
@@ -213,7 +232,7 @@ impl HashChain {
             return;
         }
         let chain = &mut self.offset_length;
-        let lent = LENT_HEADS.take();
+        let lent = with_kept(|k| std::mem::take(&mut k.heads));
         let keep = lent.is_some();
         let mut hash_to_first_index = lent.unwrap_or_default();
         hash_to_first_index.clear();
@@ -253,7 +272,7 @@ impl HashChain {
         }
         chain[pos] = hash_to_first_index[get_pix_pair_hash64(&argb[pos..pos + 2]) as usize] as u32;
         if keep {
-            LENT_HEADS.set(Some(hash_to_first_index));
+            with_kept(|k| k.heads = hash_to_first_index);
         }
 
         let ol = &mut self.offset_length;
@@ -1023,6 +1042,16 @@ pub(crate) struct RefsSet {
     pub(crate) no_cache: BackwardRefs,
     tmp: BackwardRefs,
     hash_chain_box: HashChain,
+}
+
+impl RefsSet {
+    /// Empty, as [`RefsSet::default`] is, its buffers kept.
+    pub(crate) fn clear(&mut self) {
+        self.best.clear();
+        self.no_cache.clear();
+        self.tmp.clear();
+        self.hash_chain_box.offset_length.clear();
+    }
 }
 
 /// `VP8LGetBackwardReferences`: fills `refs.best` (and `refs.no_cache` when `do_no_cache`)
