@@ -1,6 +1,8 @@
 //! LZ77 hash chains, backward references (standard, RLE and box LZ77) and colour cache
 //! sizing (libwebp's `enc/backward_references_enc.c`).
 
+use std::cell::Cell;
+
 use super::cost::trace_backwards;
 use super::entropy::prefix_encode;
 use super::histogram::Histogram;
@@ -150,6 +152,32 @@ pub(crate) fn hash_pix(argb: u32, shift: u32) -> u32 {
     argb.wrapping_mul(0x1e35a7bd) >> shift
 }
 
+thread_local! {
+    static LENT_HEADS: Cell<Option<Vec<i32>>> = const { Cell::new(None) };
+}
+
+/// A hash heads table the fills on this thread use instead of allocating their own, while it
+/// lives: the megabyte an animation's frames would otherwise map, fault in and unmap each.
+pub(crate) struct LentHeads(Option<Option<Vec<i32>>>);
+
+impl LentHeads {
+    pub(crate) fn lend(heads: Vec<i32>) -> Self {
+        Self(Some(LENT_HEADS.replace(Some(heads))))
+    }
+
+    pub(crate) fn back(mut self) -> Vec<i32> {
+        LENT_HEADS.replace(self.0.take().unwrap()).unwrap_or_default()
+    }
+}
+
+impl Drop for LentHeads {
+    fn drop(&mut self) {
+        if let Some(before) = self.0.take() {
+            LENT_HEADS.set(before);
+        }
+    }
+}
+
 /// Best match (offset << 12 | length) at every pixel.
 #[derive(Default)]
 pub(crate) struct HashChain {
@@ -185,7 +213,11 @@ impl HashChain {
             return;
         }
         let chain = &mut self.offset_length;
-        let mut hash_to_first_index = vec![-1i32; HASH_SIZE];
+        let lent = LENT_HEADS.take();
+        let keep = lent.is_some();
+        let mut hash_to_first_index = lent.unwrap_or_default();
+        hash_to_first_index.clear();
+        hash_to_first_index.resize(HASH_SIZE, -1);
         let mut argb_comp = argb[0] == argb[1];
         let mut pos = 0usize;
         while pos < size - 2 {
@@ -220,7 +252,9 @@ impl HashChain {
             }
         }
         chain[pos] = hash_to_first_index[get_pix_pair_hash64(&argb[pos..pos + 2]) as usize] as u32;
-        drop(hash_to_first_index);
+        if keep {
+            LENT_HEADS.set(Some(hash_to_first_index));
+        }
 
         let ol = &mut self.offset_length;
         ol[0] = 0;

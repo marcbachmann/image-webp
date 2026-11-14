@@ -40,6 +40,7 @@ use backward_refs::{
     LZ77_STANDARD,
 };
 use bit_writer::BitWriter;
+pub(crate) use backward_refs::LentHeads;
 use entropy::*;
 use histogram::{get_histo_image_symbols, Histogram};
 use huffman::{

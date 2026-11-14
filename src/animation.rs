@@ -14,6 +14,7 @@ use std::io::{self, Seek, SeekFrom, Write};
 
 use crate::encoder::{alpha_chunk_payload, chunk_size, write_chunk, write_chunk_parts};
 use crate::lossless::{self, EncoderParams};
+use crate::lossless::encoder::LentHeads;
 use crate::lossy::{self, fill_row_yuv, upsample_chroma_row};
 use crate::{ColorType, EncodingError, WebPEncoder};
 
@@ -185,6 +186,8 @@ pub struct AnimationEncoder<W> {
     frames_out: u32,
     started: bool,
     has_alpha: bool,
+    /// The lossless coder's hash heads, kept from frame to frame.
+    heads: Vec<i32>,
 }
 
 impl<W: Write + Seek> AnimationEncoder<W> {
@@ -222,6 +225,7 @@ impl<W: Write + Seek> AnimationEncoder<W> {
             frames_out: 0,
             started: false,
             has_alpha: false,
+            heads: Vec::new(),
         })
     }
 
@@ -487,6 +491,13 @@ impl<W: Write + Seek> AnimationEncoder<W> {
 
     /// Codes the frame as planned. A change settles how the previous frame disposes.
     fn code_frame(&mut self, plan: Plan, is_key: bool) -> Result<Coded, EncodingError> {
+        let lent = LentHeads::lend(std::mem::take(&mut self.heads));
+        let coded = self.code_planned(plan, is_key);
+        self.heads = lent.back();
+        coded
+    }
+
+    fn code_planned(&mut self, plan: Plan, is_key: bool) -> Result<Coded, EncodingError> {
         let Plan {
             rect,
             disposed,
