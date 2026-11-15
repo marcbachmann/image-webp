@@ -926,7 +926,9 @@ impl<'a> Vp8Decoder<'a> {
 #[derive(Default)]
 struct Parsed {
     mbs: Vec<(MacroBlock, [u8; 24])>,
+    /// `coeffs_cap` long, the first `used` of them the unit's.
     coeffs: Vec<i16>,
+    used: usize,
     error: Option<DecodingError>,
     /// Macroblocks and coefficients the unit holds at most, half its bytes each.
     mbs_cap: usize,
@@ -955,35 +957,31 @@ impl Parsed {
     /// Empties the unit, sized for `bytes` so that it never grows.
     fn reset(&mut self, bytes: usize) {
         self.mbs.clear();
-        self.coeffs.clear();
+        self.used = 0;
         self.error = None;
         self.mbs_cap = parsed_unit_mbs(bytes);
         self.coeffs_cap = bytes / 2 / 2;
         self.mbs.reserve_exact(self.mbs_cap);
-        self.coeffs.reserve_exact(self.coeffs_cap);
+        if self.coeffs.len() != self.coeffs_cap {
+            self.coeffs = vec![0; self.coeffs_cap];
+        }
     }
 
     /// Whether the unit holds another macroblock whatever its coefficients.
     fn has_room(&self) -> bool {
-        self.mbs.len() < self.mbs_cap && self.coeffs.len() + 384 <= self.coeffs_cap
+        self.mbs.len() < self.mbs_cap && self.used + 384 <= self.coeffs_cap
     }
 
     /// Adds a macroblock, moving its coefficients out of `blocks`, which it clears as the
-    /// reconstruction does.
+    /// reconstruction does. Every block is copied and only the coefficients of its kind kept,
+    /// the next block written over the rest: the kinds are too irregular to branch on.
     fn push(&mut self, mb: MacroBlock, kinds: &[u8; 24], blocks: &mut [i16; 384]) {
-        for (block, &kind) in blocks.as_chunks_mut::<16>().0.iter_mut().zip(kinds) {
-            match kind {
-                transform::NO_COEFFS => {}
-                transform::DC_ONLY => {
-                    self.coeffs.push(block[0]);
-                    block[0] = 0;
-                }
-                _ => {
-                    self.coeffs.extend_from_slice(block);
-                    block.fill(0);
-                }
-            }
+        const KEPT: [usize; 4] = [0, 1, 16, 16];
+        for (block, &kind) in blocks.as_chunks::<16>().0.iter().zip(kinds) {
+            self.coeffs[self.used..][..16].copy_from_slice(block);
+            self.used += KEPT[usize::from(kind & 3)];
         }
+        blocks.fill(0);
         self.mbs.push((mb, *kinds));
     }
 }
