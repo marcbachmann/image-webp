@@ -2,7 +2,8 @@
 //! lossy bitstream, an alpha plane), done ahead of the decoder on its caller's helper threads.
 //! The decoder spawns no thread: it hands the work to a [`Runner`] while the runner has an idle
 //! helper, and does the units itself otherwise. Units come out in order, and at most `ahead` of
-//! them are done and not yet taken. The decoder waits only for the unit a running helper is on.
+//! them are done and not yet taken. The decoder waits only for the unit a running helper is on,
+//! and while it does it can make the units of another part, one that no helper runs.
 
 use std::collections::VecDeque;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
@@ -22,7 +23,15 @@ pub(crate) trait Produce: Send + 'static {
 
 pub(crate) struct Ahead<P: Produce> {
     shared: Arc<Shared<P>>,
-    runner: Runner,
+    /// `None` for units made only by the threads that take them or make them aside.
+    runner: Option<Runner>,
+}
+
+/// Makes the next unit of a part where nobody makes it and there is room ahead: work for a thread
+/// that would otherwise wait.
+pub(crate) trait Aside: Send + Sync {
+    /// Whether it made one.
+    fn make_one(&self) -> bool;
 }
 
 struct Shared<P: Produce> {
@@ -37,7 +46,7 @@ struct State<P: Produce> {
     units: VecDeque<std::thread::Result<Option<P::Unit>>>,
     /// Units taken and handed back, for the producer to reuse.
     spares: Vec<P::Unit>,
-    /// Helpers handed the work and not yet back.
+    /// Helpers handed the work and not yet back, and threads making a unit aside.
     running: usize,
     /// The decoder waits for a unit.
     waiting: bool,
@@ -98,6 +107,30 @@ impl<P: Produce> Shared<P> {
     }
 }
 
+impl<P: Produce> Aside for Shared<P> {
+    fn make_one(&self) -> bool {
+        let mut state = self.lock();
+        if state.stop || state.finished || state.units.len() >= self.ahead {
+            return false;
+        }
+        let Some(mut producer) = state.producer.take() else {
+            return false;
+        };
+        let spare = state.spares.pop();
+        state.running += 1;
+        drop(state);
+        let unit = catch_unwind(AssertUnwindSafe(|| producer.produce(spare)));
+        let mut state = self.lock();
+        state.finished = !matches!(unit, Ok(Some(_)));
+        state.units.push_back(unit);
+        state.producer = Some(producer);
+        state.running -= 1;
+        drop(state);
+        self.ready.notify_all();
+        true
+    }
+}
+
 /// A helper counted in `running` until it returns or unwinds.
 struct Helping<'a, P: Produce>(&'a Shared<P>);
 
@@ -111,6 +144,21 @@ impl<P: Produce> Drop for Helping<'_, P> {
 impl<P: Produce> Ahead<P> {
     /// Units of `producer`, at most `ahead` (at least 1) of them done ahead on `runner`'s helpers.
     pub(crate) fn new(producer: P, runner: Runner, ahead: usize) -> Self {
+        Self::with(producer, Some(runner), ahead)
+    }
+
+    /// Units of `producer` made by the thread that takes them, or aside through
+    /// [`aside`](Self::aside), at most `ahead` of them ahead.
+    pub(crate) fn unhelped(producer: P, ahead: usize) -> Self {
+        Self::with(producer, None, ahead)
+    }
+
+    /// What makes this part's units aside.
+    pub(crate) fn aside(&self) -> Arc<dyn Aside> {
+        self.shared.clone()
+    }
+
+    fn with(producer: P, runner: Option<Runner>, ahead: usize) -> Self {
         let mut ahead = Self {
             shared: Arc::new(Shared {
                 state: Mutex::new(State {
@@ -127,7 +175,7 @@ impl<P: Produce> Ahead<P> {
             }),
             runner,
         };
-        let call = Self::calls_helper(&ahead.shared, &mut ahead.shared.lock());
+        let call = Self::calls_helper(&ahead.shared, ahead.runner.is_some(), &mut ahead.shared.lock());
         if call {
             ahead.call_helper();
         }
@@ -137,9 +185,15 @@ impl<P: Produce> Ahead<P> {
     /// The next unit, `None` after the last; `spent`, a unit taken before, is handed back for
     /// the producer to reuse.
     pub(crate) fn next(&mut self, spent: Option<P::Unit>) -> Option<P::Unit> {
+        self.next_aside(spent, None)
+    }
+
+    /// [`next`](Self::next), making units of `aside` instead of waiting while it has any to make.
+    pub(crate) fn next_aside(&mut self, spent: Option<P::Unit>, aside: Option<&dyn Aside>) -> Option<P::Unit> {
         let shared = &*self.shared;
         let mut state = shared.lock();
         state.spares.extend(spent);
+        let mut tried = false;
         let unit = loop {
             if let Some(unit) = state.units.pop_front() {
                 break unit;
@@ -158,9 +212,16 @@ impl<P: Produce> Ahead<P> {
                 }
                 break unit;
             }
+            if let Some(aside) = aside.filter(|_| !tried) {
+                drop(state);
+                tried = !aside.make_one();
+                state = shared.lock();
+                continue;
+            }
             state = shared.wait(state);
+            tried = false;
         };
-        let call = Self::calls_helper(shared, &mut state);
+        let call = Self::calls_helper(shared, self.runner.is_some(), &mut state);
         drop(state);
         if call {
             self.call_helper();
@@ -168,10 +229,14 @@ impl<P: Produce> Ahead<P> {
         unit.unwrap_or_else(|panic| resume_unwind(panic))
     }
 
-    /// Whether to hand the producer to a helper: none has it and there is room ahead. Counts
-    /// the helper it is handed to.
-    fn calls_helper(shared: &Shared<P>, state: &mut State<P>) -> bool {
-        let call = state.running == 0 && state.producer.is_some() && !state.finished && state.units.len() < shared.ahead;
+    /// Whether to hand the producer to a helper: there are helpers, none has it and there is room
+    /// ahead. Counts the helper it is handed to.
+    fn calls_helper(shared: &Shared<P>, helped: bool, state: &mut State<P>) -> bool {
+        let call = helped
+            && state.running == 0
+            && state.producer.is_some()
+            && !state.finished
+            && state.units.len() < shared.ahead;
         state.running += usize::from(call);
         call
     }
@@ -179,7 +244,8 @@ impl<P: Produce> Ahead<P> {
     /// Hands the producer to an idle helper, counted by [`calls_helper`](Self::calls_helper).
     fn call_helper(&mut self) {
         let helper = self.shared.clone();
-        if !(self.runner)(Box::new(move || helper.help())) {
+        let runner = self.runner.as_ref().expect("a helper is only called with a runner");
+        if !runner(Box::new(move || helper.help())) {
             self.shared.lock().running -= 1;
         }
     }
@@ -316,6 +382,39 @@ pub(crate) mod tests {
             assert_eq!(panic.downcast_ref::<String>().map(String::as_str), Some("unit 6"));
             assert_eq!(a.next(None), None);
         }
+    }
+
+    /// Sleeps a while for each unit, so that whoever takes them waits.
+    struct Slow(Arc<AtomicUsize>);
+
+    impl Produce for Slow {
+        type Unit = usize;
+
+        fn produce(&mut self, _: Option<usize>) -> Option<usize> {
+            std::thread::sleep(Duration::from_micros(200));
+            Some(self.0.fetch_add(1, Ordering::SeqCst))
+        }
+    }
+
+    #[test]
+    fn a_thread_waiting_makes_units_aside_up_to_their_window() {
+        let c = counter(100);
+        let made = c.made.clone();
+        let mut aside = Ahead::unhelped(c, 4);
+        let slow = Arc::new(AtomicUsize::new(0));
+        let mut a = Ahead::new(Slow(slow.clone()), helpers(1), 1000);
+        while slow.load(Ordering::SeqCst) == 0 {
+            std::thread::yield_now();
+        }
+        for i in 0..100 {
+            assert_eq!(a.next_aside(None, Some(&*aside.aside())), Some(i));
+            assert!(made.load(Ordering::SeqCst) <= 4, "{} made aside", made.load(Ordering::SeqCst));
+        }
+        assert_eq!(made.load(Ordering::SeqCst), 4);
+        for i in 0..100 {
+            assert_eq!(aside.next(None).unwrap(), [i]);
+        }
+        assert_eq!(aside.next(None), None);
     }
 
     #[test]

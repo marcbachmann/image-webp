@@ -1,8 +1,9 @@
 use byteorder_lite::{LittleEndian, ReadBytesExt};
 use std::default::Default;
 use std::io::{self, Read, Seek, SeekFrom};
+use std::sync::Arc;
 
-use crate::ahead::{Ahead, Produce, Runner};
+use crate::ahead::{Ahead, Aside, Produce, Runner};
 use crate::decoder::{DecodingError, UpsamplingMethod};
 use crate::ReadSeek;
 use common::*;
@@ -945,13 +946,18 @@ fn parsed_unit_bytes(mbwidth: usize) -> usize {
     row.clamp(*PARSED_UNIT_BYTES.start(), *PARSED_UNIT_BYTES.end())
 }
 
+/// The most macroblocks a [`Parsed`] unit of `bytes` holds.
+fn parsed_unit_mbs(bytes: usize) -> usize {
+    bytes / 2 / std::mem::size_of::<(MacroBlock, [u8; 24])>()
+}
+
 impl Parsed {
     /// Empties the unit, sized for `bytes` so that it never grows.
     fn reset(&mut self, bytes: usize) {
         self.mbs.clear();
         self.coeffs.clear();
         self.error = None;
-        self.mbs_cap = bytes / 2 / std::mem::size_of::<(MacroBlock, [u8; 24])>();
+        self.mbs_cap = parsed_unit_mbs(bytes);
         self.coeffs_cap = bytes / 2 / 2;
         self.mbs.reserve_exact(self.mbs_cap);
         self.coeffs.reserve_exact(self.coeffs_cap);
@@ -985,10 +991,7 @@ impl Parsed {
 /// Reads the macroblocks of a frame ahead of their reconstruction, a [`Parsed`] unit at a time.
 struct Parser {
     dec: Vp8Decoder<'static>,
-    /// The runner and units ahead a [`ModeRows`] reads the modes with once the parser starts,
-    /// after the parser has its helper.
-    modes_on: Option<(Runner, usize)>,
-    modes: Option<Box<ModesAhead>>,
+    modes: Box<ModesAhead>,
     mbx: usize,
     mby: usize,
     done: bool,
@@ -1002,12 +1005,7 @@ impl Produce for Parser {
         if self.done || self.mby == mbheight {
             return None;
         }
-        if let Some((runner, ahead)) = self.modes_on.take() {
-            let modes = ModeRows { dec: self.dec.split_modes(), mby: 0, rows: mode_unit_rows(mbwidth), done: false };
-            let ahead = Ahead::new(modes, runner, ahead);
-            self.modes = Some(Box::new(ModesAhead { ahead, unit: ModeUnit::default(), at: 0, width: mbwidth }));
-        }
-        let modes = self.modes.as_deref_mut()?;
+        let modes = &mut *self.modes;
         let mut unit = spare.unwrap_or_default();
         unit.reset(parsed_unit_bytes(mbwidth));
         let mut blocks = [0i16; 384];
@@ -1061,6 +1059,14 @@ const MODE_BYTES: usize = 8 << 10;
 
 fn mode_unit_rows(mbwidth: usize) -> usize {
     (MODE_BYTES / (mbwidth * std::mem::size_of::<MacroBlock>())).max(1)
+}
+
+/// Units of modes read ahead: the rows of the most macroblocks the parsed units ahead and the one
+/// being read hold, so that the modes the reconstructing thread reads while it waits for one
+/// parsed unit last the parser until it waits for the next.
+fn mode_units_ahead(mbwidth: usize, ahead: usize) -> usize {
+    let rows = (ahead.max(1) + 1) * parsed_unit_mbs(parsed_unit_bytes(mbwidth)).div_ceil(mbwidth);
+    rows.div_ceil(mode_unit_rows(mbwidth))
 }
 
 impl Produce for ModeRows {
@@ -1118,6 +1124,8 @@ impl ModesAhead {
 /// The macroblocks a [`Parser`] reads ahead, handed out one at a time.
 struct ParsedAhead {
     ahead: Ahead<Parser>,
+    /// Reads the parser's modes ahead.
+    aside: Arc<dyn Aside>,
     unit: Parsed,
     at: usize,
     pos: usize,
@@ -1132,7 +1140,8 @@ impl ParsedAhead {
                 return Err(e);
             }
             let spent = std::mem::take(&mut self.unit);
-            self.unit = self.ahead.next(Some(spent)).ok_or(DecodingError::BitStreamError)?;
+            let unit = self.ahead.next_aside(Some(spent), Some(&*self.aside));
+            self.unit = unit.ok_or(DecodingError::BitStreamError)?;
             self.at = 0;
             self.pos = 0;
         }
@@ -1294,7 +1303,7 @@ impl<'a, const BPP: usize> BandDecoder<'a, BPP> {
         }
         let mbwidth = usize::from(self.dec.mbwidth);
         let modes = mode_unit_rows(mbwidth) * mbwidth * std::mem::size_of::<MacroBlock>();
-        (ahead.max(1) + 2) * (parsed_unit_bytes(mbwidth) + modes)
+        (ahead.max(1) + 2) * parsed_unit_bytes(mbwidth) + (mode_units_ahead(mbwidth, ahead) + 2) * modes
     }
 
     /// Decodes macroblock rows until a band of rows is final and returns its first row and
@@ -1388,15 +1397,22 @@ impl<'a, const BPP: usize> BandDecoder<'a, BPP> {
 
 impl<const BPP: usize> BandDecoder<'static, BPP> {
     /// Reads the macroblocks ahead on `runner`'s helpers, at most `ahead` units of
-    /// [`PARSED_UNIT_BYTES`] past the one taken; before the first row.
+    /// [`PARSED_UNIT_BYTES`] past the one taken; before the first row. Their modes are read by
+    /// this thread while it waits for them, or by the parser where none are ready.
     pub(crate) fn run_ahead(&mut self, runner: Runner, ahead: usize) {
         if self.mby > 0 || self.parsed.is_some() || !self.reads_ahead() {
             return;
         }
-        let modes_on = Some((runner.clone(), ahead));
-        let parser = Parser { dec: self.dec.split_parser(), modes_on, modes: None, mbx: 0, mby: 0, done: false };
+        let mbwidth = usize::from(self.dec.mbwidth);
+        let mut dec = self.dec.split_parser();
+        let modes = ModeRows { dec: dec.split_modes(), mby: 0, rows: mode_unit_rows(mbwidth), done: false };
+        let modes = Ahead::unhelped(modes, mode_units_ahead(mbwidth, ahead));
+        let aside = modes.aside();
+        let modes = Box::new(ModesAhead { ahead: modes, unit: ModeUnit::default(), at: 0, width: mbwidth });
+        let parser = Parser { dec, modes, mbx: 0, mby: 0, done: false };
         self.parsed = Some(Box::new(ParsedAhead {
             ahead: Ahead::new(parser, runner, ahead),
+            aside,
             unit: Parsed::default(),
             at: 0,
             pos: 0,
