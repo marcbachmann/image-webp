@@ -432,3 +432,68 @@ fn decodes_ahead_as_alone_round_after_round() {
         assert!(with == alone, "round {round}: {} bands {:?} vs alone {} bands {:?}", with.0.len(), with.1, alone.0.len(), alone.1);
     }
 }
+
+/// The bands of an unscaled RGBA decode, every band handed as planes and converted, or every
+/// other one where `mixed`, and the error it stops at.
+fn planed(data: &[u8], mixed: bool) -> (Vec<(u32, Vec<u8>)>, Option<String>) {
+    let mut r = BufReader::with_capacity(61, Cursor::new(data.to_vec()));
+    let mut out = Vec::new();
+    let h = match headers::read_decoding(&mut r, 0, data.len() as u64) {
+        Ok(h) => h,
+        Err(e) => return (out, Some(format!("{e:?}"))),
+    };
+    let mut d = match FrameDecoder::from_reader(r, 0, data.len() as u64, &h, None, true) {
+        Ok(d) => d,
+        Err(e) => return (out, Some(format!("{e:?}"))),
+    };
+    let (mut held, mut full) = (Vec::new(), Vec::new());
+    loop {
+        if d.has_planes() && !(mixed && out.len() % 2 == 1) {
+            held.clear();
+            match d.next_planes(&mut held) {
+                Ok(Some(p)) => {
+                    assert_eq!(p.len(), held.len());
+                    let width = d.dimensions().0 as usize * 4;
+                    let mut rows = vec![0; (p.end - p.first) as usize * width];
+                    for (y, row) in (p.first..p.end).zip(rows.chunks_exact_mut(width)) {
+                        p.rgba_row(&held, y, &mut full, row);
+                    }
+                    out.push((p.first, rows));
+                }
+                Ok(None) => return (out, None),
+                Err(e) => return (out, Some(format!("{e:?}"))),
+            }
+            continue;
+        }
+        match d.next_band() {
+            Ok(Some((first, rows))) => out.push((first, rows.to_vec())),
+            Ok(None) => return (out, None),
+            Err(e) => return (out, Some(format!("{e:?}"))),
+        }
+    }
+}
+
+#[test]
+fn bands_held_as_planes_convert_to_the_bands() {
+    let mut rng = StdRng::seed_from_u64(5);
+    let mut cases = inputs();
+    for (w, h, alpha) in [(17, 9, 1), (33, 47, 0), (64, 23, 2), (1, 1, 1), (250, 3, 0)] {
+        let p = picture(&mut rng, w, h, alpha);
+        cases.push((format!("gen {w}x{h} alpha {alpha}"), encode_partitions(w, h, &p, 80.0, 0)));
+    }
+    let mut planes = 0;
+    for (name, data) in cases {
+        let cut = data[..data.len() * 2 / 3].to_vec();
+        let mut flipped = data.clone();
+        let at = rng.gen_range(data.len() / 3..data.len());
+        flipped[at] ^= 0x20;
+        for (kind, data) in [("whole", data), ("cut", cut), ("flipped", flipped)] {
+            let rgba = banded(&data, None, true, None);
+            for mixed in [false, true] {
+                assert_eq!(planed(&data, mixed), rgba, "{name} {kind}, mixed {mixed}");
+            }
+            planes += headers::decoding(&data).is_ok_and(|h| !h.is_lossless) as usize;
+        }
+    }
+    assert!(planes > 20, "{planes} lossy cases");
+}

@@ -11,7 +11,7 @@ use crate::decoder::DecodingError;
 use crate::extended::{read_alpha_chunk, AlphaRows};
 use crate::headers::Headers;
 use crate::lossless::{LosslessBands, LosslessDecoder};
-use crate::lossy::{BandDecoder, Channel};
+use crate::lossy::{chroma_rows, rgba_row, BandDecoder, Channel};
 use crate::rescaler::{self, Rescaler};
 use crate::{ReadSeek, UpsamplingMethod};
 
@@ -263,7 +263,87 @@ impl<'a> FrameDecoder<'a> {
     }
 }
 
+/// A band of an unscaled lossy frame held as its planes ([`FrameDecoder::next_planes`]): rows
+/// `first..end` of luma, the chroma rows from `chroma` their upsampling reads, U then V, and the
+/// band's alpha rows where the frame has alpha.
+#[derive(Clone, Copy)]
+pub struct Planes {
+    /// The band's first row.
+    pub first: u32,
+    /// The row past the band.
+    pub end: u32,
+    chroma: usize,
+    chroma_rows: usize,
+    width: usize,
+    height: usize,
+    alpha: bool,
+    upsampling: UpsamplingMethod,
+}
+
+impl Planes {
+    /// The bytes of the band's planes.
+    #[allow(clippy::len_without_is_empty)]
+    pub fn len(&self) -> usize {
+        let rows = (self.end - self.first) as usize;
+        rows * self.width * (1 + usize::from(self.alpha)) + 2 * self.chroma_rows * self.width.div_ceil(2)
+    }
+
+    /// Row `y` of the band, from its `planes`, as RGBA in `out`, as [`FrameDecoder::next_band`]
+    /// hands it; `full` is scratch.
+    pub fn rgba_row(&self, planes: &[u8], y: u32, full: &mut Vec<u8>, out: &mut [u8]) {
+        let (w, cw) = (self.width, self.width.div_ceil(2));
+        let (rows, at) = ((self.end - self.first) as usize, (y - self.first) as usize);
+        let (luma, rest) = planes.split_at(rows * w);
+        let (u, rest) = rest.split_at(self.chroma_rows * cw);
+        let (v, alpha) = rest.split_at(self.chroma_rows * cw);
+        let (near, far) = chroma_rows(y as usize, self.height, self.upsampling);
+        let (n, f) = ((near - self.chroma) * cw, (far - self.chroma) * cw);
+        let out = &mut out[..w * 4];
+        let (u, v) = ((&u[n..n + cw], &u[f..f + cw]), (&v[n..n + cw], &v[f..f + cw]));
+        rgba_row(&luma[at * w..][..w], u, v, self.upsampling, full, out);
+        match self.alpha {
+            true => put_alpha(out, &alpha[at * w..][..w]),
+            false => out.chunks_exact_mut(4).for_each(|px| px[3] = 255),
+        }
+    }
+}
+
 impl FrameDecoder<'_> {
+    /// Whether the bands come as planes ([`next_planes`](Self::next_planes)): a lossy frame
+    /// decoded to RGBA unscaled.
+    pub fn has_planes(&self) -> bool {
+        matches!(self.source, Source::Rgba(..))
+    }
+
+    /// [`next_band`](Self::next_band) as planes appended to `out`, to be converted by
+    /// [`Planes::rgba_row`]; `None` after the last band.
+    pub fn next_planes(&mut self, out: &mut Vec<u8>) -> Result<Option<Planes>, DecodingError> {
+        let (width, height) = (self.width as usize, self.height as usize);
+        let Source::Rgba(bands, alpha) = &mut self.source else {
+            return Err(DecodingError::InconsistentImageSizes);
+        };
+        let start = out.len();
+        let Some((first, end, chroma)) = bands.next_band_planes(|_, row| out.extend_from_slice(row))? else {
+            return Ok(None);
+        };
+        let chroma_rows = (out.len() - start - (end - first) * width) / (2 * width.div_ceil(2));
+        if let Some(alpha) = alpha {
+            for _ in first..end {
+                out.extend_from_slice(alpha.next_row()?);
+            }
+        }
+        Ok(Some(Planes {
+            first: first as u32,
+            end: end as u32,
+            chroma,
+            chroma_rows,
+            width,
+            height,
+            alpha: alpha.is_some(),
+            upsampling: bands.upsampling(),
+        }))
+    }
+
     /// What the decode holds at most beyond decoding on its own once [`run_ahead`](Self::run_ahead)
     /// runs parts of it `ahead` units ahead; 0 where no part would run ahead.
     pub fn ahead_bytes(&self, ahead: usize) -> usize {

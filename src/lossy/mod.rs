@@ -1328,6 +1328,41 @@ impl<'a, const BPP: usize> BandDecoder<'a, BPP> {
         Ok(Some((first, end)))
     }
 
+    /// [`next_band`](Self::next_band) as planes: hands `f` the band's luma rows, then the chroma
+    /// rows their upsampling reads, U then V. The band's first row, the row past it and its first
+    /// chroma row, or `None` after the last band.
+    pub(crate) fn next_band_planes(
+        &mut self,
+        mut f: impl FnMut(Channel, &[u8]),
+    ) -> Result<Option<(usize, usize, usize)>, DecodingError> {
+        let Some((first, end)) = self.next_rows()? else {
+            return Ok(None);
+        };
+        let dec = &self.dec;
+        let width = usize::from(dec.frame.width);
+        let height = usize::from(dec.frame.height);
+        let luma_w = usize::from(dec.mbwidth) * 16;
+        let chroma_w = luma_w / 2;
+        let chroma_width = width.div_ceil(2);
+        let (low, high) = (first..end)
+            .map(|y| chroma_rows(y, height, self.upsampling))
+            .fold((usize::MAX, 0), |(low, high), (near, far)| (low.min(near).min(far), high.max(near).max(far)));
+        for y in first..end {
+            f(Channel::Y, &dec.frame.ybuf[y.wrapping_sub(dec.y_base) * luma_w..][..width]);
+        }
+        for c in low..=high {
+            f(Channel::U, &dec.frame.ubuf[c.wrapping_sub(dec.uv_base) * chroma_w..][..chroma_width]);
+        }
+        for c in low..=high {
+            f(Channel::V, &dec.frame.vbuf[c.wrapping_sub(dec.uv_base) * chroma_w..][..chroma_width]);
+        }
+        Ok(Some((first, end, low)))
+    }
+
+    pub(crate) fn upsampling(&self) -> UpsamplingMethod {
+        self.upsampling
+    }
+
     /// Decodes macroblock rows until a band of rows is final: its first row and the row past
     /// it, or `None` after the last band.
     fn next_rows(&mut self) -> Result<Option<(usize, usize)>, DecodingError> {
@@ -1416,6 +1451,46 @@ impl<const BPP: usize> BandDecoder<'static, BPP> {
             pos: 0,
         }));
     }
+}
+
+/// The chroma rows row `y` of a frame `height` rows high is upsampled from, near and far, as
+/// [`BandDecoder::next_band`] upsamples it.
+pub(crate) fn chroma_rows(y: usize, height: usize, upsampling: UpsamplingMethod) -> (usize, usize) {
+    match upsampling {
+        UpsamplingMethod::Simple => (y / 2, y / 2),
+        UpsamplingMethod::Bilinear if y == 0 => (0, 0),
+        UpsamplingMethod::Bilinear if y + 1 == height && height % 2 == 0 => (height / 2 - 1, height / 2 - 1),
+        UpsamplingMethod::Bilinear => {
+            let k = y.div_ceil(2);
+            if y % 2 == 1 {
+                (k - 1, k)
+            } else {
+                (k, k - 1)
+            }
+        }
+    }
+}
+
+/// Row `y` as [`BandDecoder::next_band`] converts it to RGBA `out` (alpha left as it is), from its
+/// luma row and its chroma rows `u` and `v`, near and far; `full` holds two chroma rows upsampled.
+pub(crate) fn rgba_row(
+    y_row: &[u8],
+    u: (&[u8], &[u8]),
+    v: (&[u8], &[u8]),
+    upsampling: UpsamplingMethod,
+    full: &mut Vec<u8>,
+    out: &mut [u8],
+) {
+    if let UpsamplingMethod::Simple = upsampling {
+        yuv::fill_rgba_row_simple::<4>(y_row, u.0, v.0, out);
+        return;
+    }
+    let width = y_row.len();
+    full.resize(2 * width, 0);
+    let (u_full, v_full) = full.split_at_mut(width);
+    yuv::upsample_chroma_row(u.0, u.1, u_full);
+    yuv::upsample_chroma_row(v.0, v.1, v_full);
+    yuv::fill_row_yuv::<4>(out, y_row, u_full, v_full);
 }
 
 /// The fewest macroblocks a frame reads ahead: about a millisecond of work.
